@@ -88,6 +88,42 @@ ORARI_VIETATI_UTC  = list(range(1, 7))   # 6 ore vietate: 1-6 UTC (mercato morto
 ORARI_MIGLIORI_UTC = list(range(8, 15)) + [20, 21, 22]  # Ore d'oro: sessioni EU + US
 ORARI_MEDIOCRI_UTC = [0, 7, 15, 16, 17, 18, 19, 23]     # Ore mediocri: transizioni
 
+# ============================
+# ⚙️ RISK ENGINE ISTITUZIONALE
+# ============================
+MAX_PORTFOLIO_HEAT = 0.06
+MAX_SINGLE_TRADE_RISK = 0.015
+MAX_DAILY_DRAWDOWN = 0.03
+MAX_DAILY_TRADES = 8
+VOLATILITY_TARGET_ANNUAL = 0.15
+CONSECUTIVE_LOSS_SCALE = {0: 1.0, 1: 0.85, 2: 0.70, 3: 0.50, 4: 0.0}
+
+# ============================
+# 🏛️ REGIME → STRATEGY MAP
+# ============================
+REGIME_STRATEGY_MAP = {
+    "LONG_TREND":     {"allowed": ["Squeeze", "IGNITION", "NR7", "RS Leader", "Breakout"], "forbidden": ["mean_reversion"]},
+    "SHORT_TREND":    {"allowed": ["Squeeze", "IGNITION", "NR7", "RS Leader", "Breakdown"], "forbidden": ["mean_reversion"]},
+    "MEAN_REVERSION": {"allowed": ["Divergen", "hammer", "inverted"], "forbidden": ["Breakout", "IGNITION", "Breakdown"]},
+    "SHOCK":          {"allowed": [], "forbidden": ["all"]},
+}
+
+# ============================
+# 📊 WEIGHTED CONFLUENCE
+# ============================
+CONFLUENCE_WEIGHTS = {
+    "rsi_alignment": 1.0,
+    "ema_stack": 1.5,
+    "macd_alignment": 1.2,
+    "volume_strong": 2.0,
+    "cmf_concorde": 1.5,
+    "stoch_zone_ok": 0.8,
+    "tsi_concorde": 0.8,
+    "wavetrend_concorde": 0.7,
+    "structure_ok": 1.8,
+    "rvol_ok": 2.0,
+}
+
 def is_good_trading_hour() -> bool:
     ora = datetime.datetime.utcnow().hour
     if ora in ORARI_VIETATI_UTC: return False
@@ -127,6 +163,14 @@ last_hg_validated_time = {}
 last_hg_bar_immediate = {}
 signal_queue = queue.Queue()
 
+risk_engine_state = {
+    "daily_pnl_pct": 0.0,
+    "open_heat": 0.0,
+    "trades_today": 0,
+    "consecutive_losses": 0,
+    "last_reset_day": "",
+}
+
 DB_FILE = "bot_state_v15.sqlite"
 DB_LOCK = Lock()
 
@@ -142,6 +186,17 @@ def init_database():
         conn.execute("CREATE TABLE IF NOT EXISTS last_ai_call_per_symbol (symbol TEXT PRIMARY KEY, ts REAL);")
         conn.execute("CREATE TABLE IF NOT EXISTS ws_health (name TEXT PRIMARY KEY, alive INTEGER, last_msg REAL, fail_count INTEGER);")
         conn.execute("CREATE TABLE IF NOT EXISTS last_message_time (name TEXT PRIMARY KEY, ts REAL);")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trade_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, symbol TEXT, tf TEXT, direction TEXT, kind TEXT,
+                entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
+                probability REAL, confluence_score INTEGER, regime TEXT,
+                micro_score INTEGER, ai_forza TEXT, ai_successo INTEGER,
+                position_size_usd REAL, risk_pct REAL,
+                outcome TEXT DEFAULT 'pending', pnl_pct REAL DEFAULT 0.0, notes TEXT DEFAULT ''
+            );
+        """)
         conn.commit()
         conn.close()
 
@@ -416,15 +471,484 @@ def get_rvol_state(df, lookback=20):
         return "normale", rvol
     except: return "sconosciuto", 1.0
 
-def get_symbol_quality(df): return 5 # Placeholder
-def get_regime_symbol(df): return "neutro"
-def get_global_regime(): return "neutro"
-def get_risk_regime_btc_eth(): return "neutral"
+def get_symbol_quality(df):
+    """Qualità del simbolo basata su RVOL + ATR ratio + liquidità."""
+    try:
+        if df is None or len(df) < 50:
+            return -5
+        _, rvol = get_rvol_state(df)
+        atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
+        price = float(df["close"].iloc[-1])
+        if price <= 0:
+            return -5
+        atr_ratio = atr / price
+        score = 0
+        if 1.5 <= rvol <= 4.0: score += 5
+        elif 1.0 <= rvol < 1.5: score += 3
+        elif rvol < 0.7: score -= 3
+        if 0.002 <= atr_ratio <= 0.02: score += 5
+        elif 0.001 <= atr_ratio < 0.002: score += 2
+        elif atr_ratio < 0.0008: score -= 4
+        vol_avg = float(df["volume"].tail(20).mean())
+        if vol_avg > 1000000: score += 3
+        elif vol_avg > 100000: score += 1
+        else: score -= 2
+        return max(min(score, 10), -10)
+    except Exception:
+        return 0
+
+def get_regime_symbol(df):
+    """Classifica il regime del singolo simbolo."""
+    try:
+        if df is None or len(df) < 50:
+            return "neutro"
+        close = df["close"].dropna()
+        if len(close) < 50:
+            return "neutro"
+        ema50 = close.ewm(span=50).mean()
+        ema200 = close.ewm(span=200).mean()
+        if ema50.iloc[-1] > ema200.iloc[-1] * 1.005:
+            return "bull"
+        if ema50.iloc[-1] < ema200.iloc[-1] * 0.995:
+            return "bear"
+        return "neutro"
+    except Exception:
+        return "neutro"
+
+def get_global_regime():
+    """Regime globale basato su BTC + ETH combinati."""
+    try:
+        btc = historical_data.get("BTCUSDT", {}).get("1h")
+        eth = historical_data.get("ETHUSDT", {}).get("1h")
+        r_btc = get_regime_symbol(btc)
+        r_eth = get_regime_symbol(eth)
+        if r_btc == "bull" and r_eth == "bull":
+            return "bull"
+        if r_btc == "bear" and r_eth == "bear":
+            return "bear"
+        return "neutro"
+    except Exception:
+        return "neutro"
+
+def get_risk_regime_btc_eth():
+    """Risk regime basato su RSI + OBV + ATR di BTC e ETH."""
+    try:
+        btc = historical_data.get("BTCUSDT", {}).get("1h")
+        eth = historical_data.get("ETHUSDT", {}).get("1h")
+        if btc is None or eth is None:
+            return "neutral"
+        def _score(d):
+            try:
+                rsi = float(d["rsi"].iloc[-1]) if "rsi" in d.columns else 50
+                obv_slope = (float(d["obv"].iloc[-1]) - float(d["obv"].iloc[-5])) if "obv" in d.columns and len(d) > 5 else 0
+                atr = float(d["atr"].iloc[-1]) if "atr" in d.columns else 0
+                price = float(d["close"].iloc[-1])
+                atr_ratio = atr / price if price > 0 else 0
+                s = 0
+                if rsi > 55: s += 1
+                if obv_slope > 0: s += 1
+                if atr_ratio > 0.01: s += 1
+                if rsi < 45: s -= 1
+                if obv_slope < 0: s -= 1
+                if atr_ratio < 0.004: s -= 1
+                return s
+            except: return 0
+        total = _score(btc) + _score(eth)
+        if total >= 3: return "risk_on"
+        if total <= -3: return "risk_off"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
 def get_divergence_direction(div_type): 
     if "bull" in div_type: return "bull"
     if "bear" in div_type: return "bear"
     return "none"
-def get_multi_tf_divergence_state(symbol): return {}
+
+def get_multi_tf_divergence_state(symbol):
+    """Combina lo stato divergenze su 15m, 1h, 4h."""
+    try:
+        result = {}
+        if symbol not in divergence_state:
+            return result
+        for tf in ["15m", "1h", "4h"]:
+            div = divergence_state.get(symbol, {}).get(tf, {})
+            if div.get("rsi_advanced", "none") != "none":
+                result[tf] = {
+                    "type": div["rsi_advanced"],
+                    "quality": div.get("rsi_quality", 0),
+                    "early": div.get("div_early", "none"),
+                }
+        return result
+    except Exception:
+        return {}
+
+# ============================
+# 🔬 MICROSTRUCTURE ENGINE
+# ============================
+
+def fetch_open_interest(symbol):
+    """Ritorna l'Open Interest attuale da Binance Futures."""
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/fapi/v1/openInterest",
+            params={"symbol": symbol}, timeout=5
+        )
+        return float(resp.json().get("openInterest", 0))
+    except Exception:
+        return 0.0
+
+def fetch_oi_change_pct(symbol):
+    """Variazione % OI nelle ultime ore."""
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/futures/data/openInterestHist",
+            params={"symbol": symbol, "period": "1h", "limit": 5}, timeout=5
+        )
+        data = resp.json()
+        if not data or len(data) < 2:
+            return 0.0, "neutral"
+        oi_now = float(data[-1].get("sumOpenInterest", 0))
+        oi_prev = float(data[0].get("sumOpenInterest", 1))
+        if oi_prev <= 0:
+            return 0.0, "neutral"
+        oi_change = (oi_now - oi_prev) / oi_prev
+        if oi_change > 0.03:
+            return oi_change, "building"
+        elif oi_change < -0.03:
+            return oi_change, "unwinding"
+        return oi_change, "neutral"
+    except Exception:
+        return 0.0, "neutral"
+
+def fetch_top_trader_ratio(symbol):
+    """Long/Short ratio dei top trader."""
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
+            params={"symbol": symbol, "period": "1h", "limit": 1}, timeout=5
+        )
+        data = resp.json()
+        if data:
+            return float(data[-1].get("longShortRatio", 1.0))
+        return 1.0
+    except Exception:
+        return 1.0
+
+def microstructure_check(symbol, direction):
+    """Combina OI + Funding + Top Trader ratio. Ritorna (pass, details)."""
+    try:
+        funding = fetch_funding_rate(symbol)
+        oi_change, oi_state = fetch_oi_change_pct(symbol)
+        ls_ratio = fetch_top_trader_ratio(symbol)
+
+        score = 0
+        details = {
+            "funding": funding, "oi_change_pct": oi_change,
+            "oi_state": oi_state, "ls_ratio": ls_ratio,
+        }
+
+        if direction == "long":
+            if funding > 0.001: score -= 1
+            elif funding < -0.0005: score += 1
+        else:
+            if funding < -0.001: score -= 1
+            elif funding > 0.0005: score += 1
+
+        if oi_state == "building": score += 1
+        elif oi_state == "unwinding": score -= 1
+
+        if direction == "long" and ls_ratio > 2.0: score -= 1
+        elif direction == "short" and ls_ratio < 0.5: score -= 1
+
+        details["micro_score"] = score
+        return score >= -1, details
+    except Exception:
+        return True, {"micro_score": 0}
+
+# ============================
+# ⚙️ RISK ENGINE FUNCTIONS
+# ============================
+
+def reset_daily_risk_if_needed():
+    today = datetime.datetime.utcnow().date().isoformat()
+    if risk_engine_state.get("last_reset_day") != today:
+        risk_engine_state["daily_pnl_pct"] = 0.0
+        risk_engine_state["trades_today"] = 0
+        risk_engine_state["last_reset_day"] = today
+        logger.info("🔄 [RISK] Reset giornaliero contatori")
+
+def check_risk_limits():
+    """Verifica se il Risk Engine permette nuovi trade."""
+    reset_daily_risk_if_needed()
+    if risk_engine_state["daily_pnl_pct"] <= -MAX_DAILY_DRAWDOWN:
+        return False, f"Max daily DD ({risk_engine_state['daily_pnl_pct']*100:.1f}%)"
+    if risk_engine_state["trades_today"] >= MAX_DAILY_TRADES:
+        return False, f"Max trade giornalieri ({MAX_DAILY_TRADES})"
+    if risk_engine_state["open_heat"] >= MAX_PORTFOLIO_HEAT:
+        return False, f"Portfolio heat max ({risk_engine_state['open_heat']*100:.1f}%)"
+    cl = risk_engine_state["consecutive_losses"]
+    if cl >= 4:
+        return False, "4+ perdite consecutive"
+    return True, "OK"
+
+def calc_dynamic_position_size(df, direction, entry, sl, signal_probability, balance=None):
+    """Position sizing: Kelly + Vol Target + Heat + Loss scaling."""
+    try:
+        if balance is None: balance = ACCOUNT_BALANCE
+        if not entry or not sl or entry <= 0 or sl <= 0:
+            return 0.0, 0.0, {"reason": "Livelli mancanti"}
+
+        risk_per_unit = abs(entry - sl)
+        if risk_per_unit <= 0:
+            return 0.0, 0.0, {"reason": "SL=Entry"}
+        risk_pct_per_unit = risk_per_unit / entry
+
+        reward_risk = 2.0
+        vol_scale = 1.0
+        if df is not None and "atr" in df.columns:
+            atr = float(df["atr"].iloc[-1])
+            price = float(df["close"].iloc[-1])
+            if atr > 0 and risk_per_unit > 0:
+                reward_risk = max(1.0, min(4.0, (2.0 * atr) / risk_per_unit))
+            if price > 0:
+                daily_vol = (atr / price) * np.sqrt(365)
+                if daily_vol > 0:
+                    vol_scale = min(1.5, VOLATILITY_TARGET_ANNUAL / daily_vol)
+
+        kelly_raw = signal_probability - ((1 - signal_probability) / reward_risk)
+        kelly_pct = max(0.0, kelly_raw * 0.4)
+        kelly_pct = min(kelly_pct, MAX_SINGLE_TRADE_RISK)
+        kelly_pct *= vol_scale
+
+        cl = risk_engine_state.get("consecutive_losses", 0)
+        loss_scale = CONSECUTIVE_LOSS_SCALE.get(min(cl, 4), 0.0)
+        kelly_pct *= loss_scale
+
+        remaining = MAX_PORTFOLIO_HEAT - risk_engine_state.get("open_heat", 0)
+        kelly_pct = min(kelly_pct, max(0, remaining))
+
+        risk_usd = balance * kelly_pct
+        size_usd = risk_usd / risk_pct_per_unit if risk_pct_per_unit > 0 else 0
+
+        return size_usd, kelly_pct, {
+            "kelly_raw": kelly_raw, "kelly_safe_pct": kelly_pct * 100,
+            "vol_scale": vol_scale, "loss_scale": loss_scale,
+            "risk_usd": risk_usd, "size_usd": size_usd, "reward_risk": reward_risk,
+        }
+    except Exception:
+        return 0.0, 0.0, {"reason": "Errore calcolo"}
+
+def update_risk_after_signal(risk_pct):
+    risk_engine_state["open_heat"] += risk_pct
+    risk_engine_state["trades_today"] += 1
+
+def is_strategy_allowed_for_regime(signal_kind, regime):
+    """Verifica se il tipo di segnale è permesso nel regime attuale."""
+    try:
+        if regime == "SHOCK":
+            return False
+        config = REGIME_STRATEGY_MAP.get(regime)
+        if not config:
+            return True
+        for forbidden in config.get("forbidden", []):
+            if forbidden == "all": return False
+            if forbidden.lower() in signal_kind.lower(): return False
+        allowed = config.get("allowed", [])
+        if not allowed: return True
+        for pattern in allowed:
+            if pattern.lower() in signal_kind.lower(): return True
+        return False
+    except Exception:
+        return True
+
+def calc_weighted_confluence(df, direction):
+    """Punteggio confluenza pesato 0-100."""
+    try:
+        if df is None or len(df) < 50: return 30
+        score = 0.0
+        max_score = 0.0
+
+        max_score += CONFLUENCE_WEIGHTS["rsi_alignment"]
+        if "rsi" in df.columns:
+            rsi = float(df["rsi"].iloc[-1])
+            if direction == "long" and 40 < rsi < 70: score += CONFLUENCE_WEIGHTS["rsi_alignment"]
+            elif direction == "short" and 30 < rsi < 60: score += CONFLUENCE_WEIGHTS["rsi_alignment"]
+
+        max_score += CONFLUENCE_WEIGHTS["ema_stack"]
+        try:
+            e20 = df["close"].ewm(span=20).mean().iloc[-1]
+            e50 = df["close"].ewm(span=50).mean().iloc[-1]
+            e200 = df["close"].ewm(span=200).mean().iloc[-1]
+            if direction == "long" and e20 > e50 > e200: score += CONFLUENCE_WEIGHTS["ema_stack"]
+            elif direction == "short" and e20 < e50 < e200: score += CONFLUENCE_WEIGHTS["ema_stack"]
+        except: pass
+
+        max_score += CONFLUENCE_WEIGHTS["macd_alignment"]
+        if "macd" in df.columns and "macd_signal" in df.columns:
+            m = float(df["macd"].iloc[-1])
+            s = float(df["macd_signal"].iloc[-1])
+            if direction == "long" and m > s: score += CONFLUENCE_WEIGHTS["macd_alignment"]
+            elif direction == "short" and m < s: score += CONFLUENCE_WEIGHTS["macd_alignment"]
+
+        max_score += CONFLUENCE_WEIGHTS["volume_strong"]
+        _, rvol = get_rvol_state(df)
+        if rvol >= 1.5: score += CONFLUENCE_WEIGHTS["volume_strong"]
+        elif rvol >= 1.2: score += CONFLUENCE_WEIGHTS["volume_strong"] * 0.5
+
+        max_score += CONFLUENCE_WEIGHTS["cmf_concorde"]
+        if "cmf" in df.columns:
+            cmf = float(df["cmf"].iloc[-1])
+            if (direction == "long" and cmf > 0.03) or (direction == "short" and cmf < -0.03):
+                score += CONFLUENCE_WEIGHTS["cmf_concorde"]
+
+        max_score += CONFLUENCE_WEIGHTS["stoch_zone_ok"]
+        if "stoch_k" in df.columns:
+            sk = float(df["stoch_k"].iloc[-1])
+            if direction == "long" and sk < 80: score += CONFLUENCE_WEIGHTS["stoch_zone_ok"]
+            elif direction == "short" and sk > 20: score += CONFLUENCE_WEIGHTS["stoch_zone_ok"]
+
+        max_score += CONFLUENCE_WEIGHTS["tsi_concorde"]
+        if "tsi" in df.columns:
+            tsi = float(df["tsi"].iloc[-1])
+            if (direction == "long" and tsi > 0) or (direction == "short" and tsi < 0):
+                score += CONFLUENCE_WEIGHTS["tsi_concorde"]
+
+        max_score += CONFLUENCE_WEIGHTS["wavetrend_concorde"]
+        if "wt1" in df.columns and "wt2" in df.columns:
+            w1 = float(df["wt1"].iloc[-1])
+            w2 = float(df["wt2"].iloc[-1])
+            if (direction == "long" and w1 > w2) or (direction == "short" and w1 < w2):
+                score += CONFLUENCE_WEIGHTS["wavetrend_concorde"]
+
+        max_score += CONFLUENCE_WEIGHTS["structure_ok"]
+        try:
+            h = df["high"].tail(10)
+            l = df["low"].tail(10)
+            if direction == "long" and l.iloc[-1] > l.iloc[-5] and h.iloc[-1] > h.iloc[-5]:
+                score += CONFLUENCE_WEIGHTS["structure_ok"]
+            elif direction == "short" and h.iloc[-1] < h.iloc[-5] and l.iloc[-1] < l.iloc[-5]:
+                score += CONFLUENCE_WEIGHTS["structure_ok"]
+        except: pass
+
+        max_score += CONFLUENCE_WEIGHTS["rvol_ok"]
+        if rvol >= 2.0: score += CONFLUENCE_WEIGHTS["rvol_ok"]
+        elif rvol >= 1.3: score += CONFLUENCE_WEIGHTS["rvol_ok"] * 0.5
+
+        if max_score <= 0: return 30
+        return int(min(100, (score / max_score) * 100))
+    except Exception:
+        return 30
+
+def calculate_signal_probability(df, direction, features, regime, tf):
+    """P(successo) bayesiano: Regime + Trend + Volume + Indicatori + Micro."""
+    try:
+        if df is None or len(df) < 50: return 0.30
+        p = 0.50
+
+        # 1. Regime (±15%)
+        if regime in ("LONG_TREND", "SHORT_TREND"):
+            if (regime == "LONG_TREND" and direction == "long") or (regime == "SHORT_TREND" and direction == "short"):
+                p += 0.15
+            else:
+                p -= 0.20
+        elif regime == "MEAN_REVERSION":
+            kind = features.get("kind", "") if isinstance(features, dict) else ""
+            if "Squeeze" in kind or "NR7" in kind: p -= 0.10
+            else: p += 0.10
+        elif regime == "SHOCK":
+            p -= 0.15
+
+        # 2. Trend (±10%)
+        trend = get_trend(df)
+        if (direction == "long" and trend == "rialzista") or (direction == "short" and trend == "ribassista"):
+            p += 0.10
+        elif (direction == "long" and trend == "ribassista") or (direction == "short" and trend == "rialzista"):
+            p -= 0.10
+
+        # 3. Volume (±12%)
+        rvol = float(features.get("rvol", 1.0)) if isinstance(features, dict) else 1.0
+        if rvol >= 4.0: p += 0.12
+        elif rvol >= 2.5: p += 0.08
+        elif rvol >= 1.5: p += 0.04
+        elif rvol < 0.8: p -= 0.08
+
+        # 4. Confluence (±15%)
+        confluence = calc_weighted_confluence(df, direction)
+        if confluence >= 70: p += 0.15
+        elif confluence >= 50: p += 0.08
+        elif confluence >= 30: p += 0.03
+        elif confluence < 20: p -= 0.12
+
+        # 5. CMF micro (±5%)
+        try:
+            if "cmf" in df.columns:
+                cmf = float(df["cmf"].iloc[-1])
+                if (direction == "long" and cmf > 0.08) or (direction == "short" and cmf < -0.08): p += 0.03
+                elif (direction == "long" and cmf < -0.10) or (direction == "short" and cmf > 0.10): p -= 0.05
+        except: pass
+
+        # 6. Body ratio (±5%)
+        if isinstance(features, dict):
+            body = float(features.get("body_ratio", 0.5))
+            if body >= 0.80: p += 0.05
+            elif body < 0.40: p -= 0.05
+
+        # 7. Time of day (±3%)
+        ora = datetime.datetime.utcnow().hour
+        if ora in ORARI_MIGLIORI_UTC: p += 0.03
+        elif ora in ORARI_MEDIOCRI_UTC: p -= 0.03
+
+        return max(0.05, min(0.95, p))
+    except Exception:
+        return 0.40
+
+def log_trade_to_journal(symbol, tf, direction, kind, entry, sl, tp1, tp2, tp3,
+                          probability, confluence_score, regime, micro_score,
+                          ai_forza, ai_successo, position_size_usd, risk_pct):
+    try:
+        with DB_LOCK:
+            conn = get_db_connection()
+            conn.execute("""
+                INSERT INTO trade_journal
+                (timestamp, symbol, tf, direction, kind, entry, sl, tp1, tp2, tp3,
+                 probability, confluence_score, regime, micro_score,
+                 ai_forza, ai_successo, position_size_usd, risk_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.datetime.utcnow().isoformat(), symbol, tf, direction, kind,
+                entry, sl, tp1, tp2, tp3, probability, confluence_score, regime,
+                micro_score, ai_forza, ai_successo, position_size_usd, risk_pct
+            ))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"[JOURNAL] Errore: {e}")
+
+def get_rolling_stats(lookback_trades=50):
+    try:
+        with DB_LOCK:
+            conn = get_db_connection()
+            rows = conn.execute(
+                "SELECT outcome, pnl_pct FROM trade_journal WHERE outcome != 'pending' ORDER BY id DESC LIMIT ?",
+                (lookback_trades,)
+            ).fetchall()
+            conn.close()
+        if not rows:
+            return {"win_rate": 0.55, "avg_pnl": 0.0, "total_trades": 0, "max_dd": 0.0}
+        wins = sum(1 for r in rows if r[0] == "win")
+        total = len(rows)
+        pnls = [r[1] for r in rows]
+        cumulative = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for pnl in reversed(pnls):
+            cumulative += pnl
+            peak = max(peak, cumulative)
+            max_dd = max(max_dd, peak - cumulative)
+        return {"win_rate": wins / total if total > 0 else 0.55, "avg_pnl": sum(pnls) / total if total > 0 else 0.0, "total_trades": total, "max_dd": max_dd}
+    except Exception:
+        return {"win_rate": 0.55, "avg_pnl": 0.0, "total_trades": 0, "max_dd": 0.0}
 
 # ============================
 # AI CALL SAFE (DUAL ROLE: SCOUT + ANALYST)
@@ -2264,6 +2788,19 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
     else: 
         msg += f"▪️ Entry: `{entry}`\n⚠️ Volatilità insufficiente per SL/TP completi"
 
+    # QUANT ENGINE DATA
+    regime_label, _ = get_probabilistic_regime(df)
+    confluence = calc_weighted_confluence(df, direction)
+    probability = calculate_signal_probability(df, direction, features, regime_label, tf)
+    size_usd, risk_pct, sizing_details = calc_dynamic_position_size(df, direction, entry, sl, probability)
+
+    msg += f"\n📐 QUANT ENGINE:\n"
+    msg += f"  🎯 P(successo): {probability:.0%}\n"
+    msg += f"  📊 Confluenza: {confluence}/100\n"
+    msg += f"  🏛️ Regime: {regime_label}\n"
+    msg += f"  💰 Size: ${size_usd:.2f} ({risk_pct*100:.2f}% risk)\n"
+    msg += f"  📈 R:R: {sizing_details.get('reward_risk', 2.0):.1f}:1\n"
+
     # ==========================================
     # --- SISTEMA ASINCRONO VELOCE ---
     # ==========================================
@@ -2279,6 +2816,23 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
         name=f"NOTIFY_HG_{symbol}"
     )
     t.start()
+
+    # LOG TO JOURNAL
+    try:
+        micro_sc = 0
+        ai_f = ai_forza if 'ai_forza' in dir() else "n/a"
+        ai_s = int(ai_res.get('successo', 0)) if 'ai_res' in dir() and ai_res else 0
+        log_trade_to_journal(
+            symbol=symbol, tf=tf, direction=direction, kind=kind,
+            entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+            probability=probability, confluence_score=confluence,
+            regime=regime_label, micro_score=micro_sc,
+            ai_forza=ai_f, ai_successo=ai_s,
+            position_size_usd=size_usd, risk_pct=risk_pct
+        )
+        update_risk_after_signal(risk_pct)
+    except Exception as e:
+        logger.debug(f"[JOURNAL] Errore post-signal: {e}")
 
 
 # ============================
@@ -2570,17 +3124,35 @@ def update_realtime(symbol, tf, k):
                                             time.time() - last_hg_immediate_time.get(key, 0)
                                             >= cfg["cooldown"]
                                         ):
-                                            send_hidden_gem(
-                                                symbol,
-                                                tf,
-                                                ev["dir"],
-                                                ev["kind"],
-                                                ev,
-                                                df,
-                                                phase_label=f"IMMEDIATA (score={score_adj:.2f})",
-                                            )
-                                            last_hg_bar_immediate[key] = last_key
-                                            last_hg_immediate_time[key] = time.time()
+                                            # INSTITUTIONAL GATE
+                                            risk_ok, risk_reason = check_risk_limits()
+                                            if not risk_ok:
+                                                logger.info(f"🛑 [RISK] {symbol} bloccato: {risk_reason}")
+                                            else:
+                                                regime_now, _ = get_probabilistic_regime(df)
+                                                if not is_strategy_allowed_for_regime(ev["kind"], regime_now):
+                                                    logger.info(f"🏛️ [REGIME] {symbol} {ev['kind']} vietato in {regime_now}")
+                                                else:
+                                                    micro_ok, micro_det = microstructure_check(symbol, ev["dir"])
+                                                    if not micro_ok:
+                                                        logger.info(f"🔬 [MICRO] {symbol} bloccato: score={micro_det.get('micro_score')}")
+                                                    else:
+                                                        prob = calculate_signal_probability(df, ev["dir"], ev, regime_now, tf)
+                                                        if prob < 0.72:
+                                                            logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 72%")
+                                                        else:
+                                                            # ALL GATES PASSED → SEND
+                                                            send_hidden_gem(
+                                                                symbol,
+                                                                tf,
+                                                                ev["dir"],
+                                                                ev["kind"],
+                                                                ev,
+                                                                df,
+                                                                phase_label=f"IMMEDIATA (P={prob:.0%} C={calc_weighted_confluence(df, ev['dir'])} R={regime_now})",
+                                                            )
+                                                            last_hg_bar_immediate[key] = last_key
+                                                            last_hg_immediate_time[key] = time.time()
                 
             # Se la candela non è chiusa, fermati qui
             if not closed:
@@ -2624,7 +3196,26 @@ def update_realtime(symbol, tf, k):
                     key = f"{symbol}_{tf}"
                     if (time.time() - last_hg_validated_time.get(key, 0) < cfg["cooldown"]):
                         continue
-                        
+
+                    # INSTITUTIONAL GATE
+                    risk_ok, risk_reason = check_risk_limits()
+                    if not risk_ok:
+                        logger.info(f"🛑 [RISK] {symbol} bloccato: {risk_reason}")
+                        continue
+                    regime_now, _ = get_probabilistic_regime(df)
+                    if not is_strategy_allowed_for_regime(ev["kind"], regime_now):
+                        logger.info(f"🏛️ [REGIME] {symbol} {ev['kind']} vietato in {regime_now}")
+                        continue
+                    micro_ok, micro_det = microstructure_check(symbol, ev["dir"])
+                    if not micro_ok:
+                        logger.info(f"🔬 [MICRO] {symbol} bloccato: score={micro_det.get('micro_score')}")
+                        continue
+                    prob = calculate_signal_probability(df, ev["dir"], ev, regime_now, tf)
+                    if prob < 0.72:
+                        logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 72%")
+                        continue
+
+                    # ALL GATES PASSED → SEND
                     send_hidden_gem(
                         symbol,
                         tf,
@@ -2632,7 +3223,7 @@ def update_realtime(symbol, tf, k):
                         ev["kind"],
                         ev,
                         df,
-                        phase_label="VALIDATA",
+                        phase_label=f"VALIDATA (P={prob:.0%} C={calc_weighted_confluence(df, ev['dir'])} R={regime_now})",
                     )
                     last_hg_validated_time[key] = time.time()
 
