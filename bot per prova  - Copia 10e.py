@@ -84,8 +84,9 @@ BREAKOUT_RULES = {
     "1h": {"vol_min": 0.6, "break_mult": 1.001, "min_closes": 1, "atr_mult": 0.08},
     "15m": {"vol_min": 0.6, "break_mult": 1.0004, "min_closes": 1, "atr_mult": 0.05},
 }
-ORARI_VIETATI_UTC  = list(range(2, 6))
-ORARI_MIGLIORI_UTC = list(range(8, 16)) + list(range(20, 24))
+ORARI_VIETATI_UTC  = list(range(1, 7))   # 6 ore vietate: 1-6 UTC (mercato morto)
+ORARI_MIGLIORI_UTC = list(range(8, 15)) + [20, 21, 22]  # Ore d'oro: sessioni EU + US
+ORARI_MEDIOCRI_UTC = [0, 7, 15, 16, 17, 18, 19, 23]     # Ore mediocri: transizioni
 
 def is_good_trading_hour() -> bool:
     ora = datetime.datetime.utcnow().hour
@@ -245,12 +246,64 @@ def calc_macd(series):
     signal = macd.ewm(span=9).mean()
     return macd, signal, macd - signal
 
-def calc_wavetrend(df, chlen=10, avg=21, malen=4): return pd.Series(0, index=df.index), pd.Series(0, index=df.index) # Placeholder
-def calc_cci(df): return pd.Series(0, index=df.index) # Placeholder
-def calc_stoch(df): return pd.Series(0, index=df.index), pd.Series(0, index=df.index) # Placeholder
-def calc_cmf(df): return pd.Series(0, index=df.index) # Placeholder
-def calc_roc(df): return pd.Series(0, index=df.index) # Placeholder
-def calc_tsi(df): return pd.Series(0, index=df.index) # Placeholder
+def calc_wavetrend(df, chlen=10, avg=21, malen=4):
+    try:
+        hlc3 = (df["high"] + df["low"] + df["close"]) / 3
+        esa = hlc3.ewm(span=chlen, adjust=False).mean()
+        d = abs(hlc3 - esa).ewm(span=chlen, adjust=False).mean()
+        ci = (hlc3 - esa) / (0.015 * d).replace(0, np.nan)
+        wt1 = ci.ewm(span=avg, adjust=False).mean()
+        wt2 = wt1.ewm(span=malen, adjust=False).mean()
+        return wt1.fillna(0), wt2.fillna(0)
+    except:
+        return pd.Series(0, index=df.index), pd.Series(0, index=df.index)
+
+def calc_cci(df, period=20):
+    try:
+        tp = (df["high"] + df["low"] + df["close"]) / 3
+        sma = tp.rolling(period).mean()
+        mad = (tp - sma).abs().rolling(period).mean()
+        return ((tp - sma) / (0.015 * mad)).fillna(0)
+    except:
+        return pd.Series(0, index=df.index)
+
+def calc_stoch(df, k_period=14, d_period=3):
+    try:
+        low_min = df["low"].rolling(k_period).min()
+        high_max = df["high"].rolling(k_period).max()
+        den = (high_max - low_min).replace(0, np.nan)
+        stoch_k = 100 * (df["close"] - low_min) / den
+        stoch_d = stoch_k.rolling(d_period).mean()
+        return stoch_k.fillna(50), stoch_d.fillna(50)
+    except:
+        return pd.Series(50, index=df.index), pd.Series(50, index=df.index)
+
+def calc_cmf(df, period=20):
+    try:
+        den = (df["high"] - df["low"]).replace(0, np.nan)
+        mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / den
+        mfv = mfm.fillna(0) * df["volume"]
+        vol_sum = df["volume"].rolling(period).sum().replace(0, np.nan)
+        return (mfv.rolling(period).sum() / vol_sum).fillna(0)
+    except:
+        return pd.Series(0, index=df.index)
+
+def calc_roc(series, period=10):
+    try:
+        prev = series.shift(period)
+        return ((series - prev) / prev.replace(0, np.nan) * 100).fillna(0)
+    except:
+        return pd.Series(0, index=series.index)
+
+def calc_tsi(series, r=25, s=13):
+    try:
+        diff = series.diff()
+        abs_diff = diff.abs()
+        num = diff.ewm(span=r, adjust=False).mean().ewm(span=s, adjust=False).mean()
+        den = abs_diff.ewm(span=r, adjust=False).mean().ewm(span=s, adjust=False).mean()
+        return (100 * num / den.replace(0, np.nan)).fillna(0)
+    except:
+        return pd.Series(0, index=series.index)
 
 def compute_indicators(df):
     if df is None or df.empty: return df
@@ -260,6 +313,12 @@ def compute_indicators(df):
         df["atr"] = calc_atr(df)
         df["obv"] = calc_obv(df)
         df["macd"], df["macd_signal"], df["macd_hist"] = calc_macd(df["close"])
+        df["wt1"], df["wt2"] = calc_wavetrend(df)
+        df["cci"] = calc_cci(df)
+        df["stoch_k"], df["stoch_d"] = calc_stoch(df)
+        df["cmf"] = calc_cmf(df)
+        df["roc"] = calc_roc(df["close"])
+        df["tsi"] = calc_tsi(df["close"])
     except: pass
     return df
 # ============================
@@ -977,6 +1036,113 @@ def get_risk_regime_btc_eth():
         return "neutral"
 
 
+def fetch_funding_rate(symbol):
+    """Ritorna il funding rate attuale da Binance Futures. Positivo = troppi long, Negativo = troppi short."""
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": symbol},
+            timeout=5
+        )
+        data = resp.json()
+        return float(data.get("lastFundingRate", 0))
+    except Exception:
+        return 0.0
+
+
+def check_btc_correlation_filter(direction):
+    """
+    Blocca segnali long se BTC sta crollando forte, e short se BTC sta pompando forte.
+    Ritorna True se il segnale è OK, False se deve essere bloccato.
+    """
+    try:
+        btc_df = historical_data.get("BTCUSDT", {}).get("1h")
+        if btc_df is None or len(btc_df) < 5:
+            return True  # Non bloccare se dati mancanti
+        btc_now = btc_df["close"].iloc[-1]
+        btc_5h_ago = btc_df["close"].iloc[-5]
+        if btc_5h_ago <= 0:
+            return True
+        btc_change_5h = (btc_now - btc_5h_ago) / btc_5h_ago
+        # BTC crolla -2% in 5h → blocca long su altcoin
+        if direction == "long" and btc_change_5h < -0.02:
+            return False
+        # BTC pompa +2% in 5h → blocca short su altcoin
+        if direction == "short" and btc_change_5h > 0.02:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def calc_volume_profile_poc(df, bins=50, lookback=50):
+    """
+    Calcola il Point of Control (POC) = prezzo dove si è concentrato il massimo volume.
+    Il POC agisce come supporto/resistenza dinamico.
+    """
+    try:
+        if df is None or len(df) < lookback:
+            return None
+        recent = df.tail(lookback)
+        price_min = recent["low"].min()
+        price_max = recent["high"].max()
+        if price_max <= price_min:
+            return None
+        prices = np.linspace(price_min, price_max, bins)
+        vol_profile = np.zeros(bins - 1)
+        for i in range(len(recent)):
+            row_low = recent["low"].iloc[i]
+            row_high = recent["high"].iloc[i]
+            row_vol = recent["volume"].iloc[i]
+            mask = (prices[:-1] >= row_low) & (prices[:-1] <= row_high)
+            vol_profile[mask] += row_vol
+        poc_idx = np.argmax(vol_profile)
+        poc_price = (prices[poc_idx] + prices[poc_idx + 1]) / 2
+        return float(poc_price)
+    except Exception:
+        return None
+
+
+def detect_macd_divergence(df, lookback=50):
+    """
+    Rileva divergenze sul MACD Histogram.
+    Ritorna: 'bullish', 'bearish', o 'none'
+    """
+    try:
+        if df is None or len(df) < lookback:
+            return "none"
+        if "macd_hist" not in df.columns:
+            return "none"
+
+        hist = df["macd_hist"].dropna().iloc[-lookback:]
+        prices = df["close"].iloc[-lookback:]
+
+        if len(hist) < 20:
+            return "none"
+
+        # Trova minimi del prezzo e dell'histogram
+        price_lows = argrelextrema(prices.values, np.less_equal, order=3)[0]
+
+        if len(price_lows) >= 2:
+            i1, i2 = price_lows[-2], price_lows[-1]
+            # Bullish: prezzo fa lower low, MACD hist fa higher low
+            if prices.iloc[i2] < prices.iloc[i1] and hist.iloc[i2] > hist.iloc[i1]:
+                return "bullish"
+
+        # Trova massimi del prezzo
+        price_highs = argrelextrema(prices.values, np.greater_equal, order=3)[0]
+
+        if len(price_highs) >= 2:
+            i1, i2 = price_highs[-2], price_highs[-1]
+            # Bearish: prezzo fa higher high, MACD hist fa lower high
+            if prices.iloc[i2] > prices.iloc[i1] and hist.iloc[i2] < hist.iloc[i1]:
+                return "bearish"
+
+        return "none"
+    except Exception:
+        return "none"
+
+
 def get_divergence_direction(div_type: str) -> str:
     if div_type in ["bullish_classic", "bullish_hidden", "bullish_early"]:
         return "bull"
@@ -1272,6 +1438,37 @@ def _estimate_hg_score(features: dict, df: pd.DataFrame, direction: str) -> floa
             p += 0.20
         if rs_slope >= HG_RS_SLOPE_MIN:
             p += 0.20
+
+        # --- NUOVI FILTRI INDICATORI REALI ---
+        try:
+            # CMF: Flusso di denaro concorde con la direzione
+            if "cmf" in df.columns:
+                cmf_val = float(df["cmf"].iloc[-1])
+                if (direction == "long" and cmf_val > 0.05) or (direction == "short" and cmf_val < -0.05):
+                    p += 0.10  # Flusso di denaro forte e concorde
+                elif (direction == "long" and cmf_val < -0.10) or (direction == "short" and cmf_val > 0.10):
+                    p -= 0.10  # Flusso CONTRARIO → penalizza
+
+            # Stochastic: Non entrare in zone estreme contro-trend
+            if "stoch_k" in df.columns:
+                stoch_val = float(df["stoch_k"].iloc[-1])
+                if direction == "long" and stoch_val > 90:
+                    p -= 0.08  # Overbought estremo, long rischioso
+                elif direction == "short" and stoch_val < 10:
+                    p -= 0.08  # Oversold estremo, short rischioso
+                elif (direction == "long" and 20 < stoch_val < 70) or (direction == "short" and 30 < stoch_val < 80):
+                    p += 0.05  # Zona favorevole
+
+            # TSI: Momentum puro concorde
+            if "tsi" in df.columns:
+                tsi_val = float(df["tsi"].iloc[-1])
+                if (direction == "long" and tsi_val > 5) or (direction == "short" and tsi_val < -5):
+                    p += 0.05  # Momentum concorde
+                elif (direction == "long" and tsi_val < -15) or (direction == "short" and tsi_val > 15):
+                    p -= 0.05  # Momentum fortemente contrario
+        except:
+            pass
+
         return max(0.0, min(1.0, p))
     except Exception:
         return 0.0
@@ -1989,6 +2186,17 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
         if tp3: tp3 = round_to(tp3, filters["tickSize"])
     except: pass
 
+    # NUOVO: Volume Profile POC
+    poc = calc_volume_profile_poc(df)
+    poc_info = ""
+    if poc is not None:
+        try:
+            poc = round_to(poc, filters["tickSize"])
+        except:
+            pass
+        poc_dist_pct = abs(entry - poc) / entry * 100 if entry and entry > 0 else 0
+        poc_info = f"📍 POC (Vol Profile): {poc} ({poc_dist_pct:.1f}% dist)\n"
+
     score = 0.0
     rvol = float(features.get("rvol", 1.0))
     score += min((rvol - 1.0) / 3.0, 0.35) if rvol > 1 else 0.0
@@ -2032,6 +2240,7 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
     msg += f"💥 *Fase:* {phase_label}\n"
     msg += f"📦 RVOL: {features.get('rvol',0):.2f} | 📊 Score Tech: {score:.2f}\n"
     msg += f"💪 *Forza Segnale:* {forza_label}\n"
+    msg += poc_info
     
     if commento_ai:
         msg += f"🤖 AI Check: {commento_ai}\n"
@@ -2111,6 +2320,20 @@ def process_closed_candle(symbol, tf, k):
 
         max_age = DIVERGENCE_MAX_AGE_BY_TF.get(tf, 3)
         if not is_recent_divergence(div_index, df, max_candles=max_age): return
+
+        # NUOVO: Richiedi conferma MACD divergence
+        macd_div = detect_macd_divergence(df)
+        rsi_div_dir = div_state.get("rsi_advanced", "none")
+
+        # Se c'è divergenza RSI bullish, verifica che anche MACD confermi (o almeno non contraddica)
+        if rsi_div_dir.startswith("bullish") and macd_div == "bearish":
+            return  # RSI dice bullish ma MACD dice bearish → contraddizione, scarta
+        if rsi_div_dir.startswith("bearish") and macd_div == "bullish":
+            return  # RSI dice bearish ma MACD dice bullish → contraddizione, scarta
+
+        # BONUS: Se entrambi concordano, il segnale è molto più forte
+        macd_confirms = (rsi_div_dir.startswith("bullish") and macd_div == "bullish") or \
+                        (rsi_div_dir.startswith("bearish") and macd_div == "bearish")
 
         # --- REGIME DETECTION & Z-SCORE ADATTIVO ---
         current_regime, regime_scores = get_probabilistic_regime(df)
@@ -2319,23 +2542,45 @@ def update_realtime(symbol, tf, k):
                                 "rialzista" if ev["dir"] == "long" else "ribassista"
                             )
                         if trend_ok:
-                            last_key = (int(k.get("t", 0)), ev["dir"], tf)
-                            key = f"{symbol}_{tf}"
-                            if last_hg_bar_immediate.get(key) != last_key and (
-                                time.time() - last_hg_immediate_time.get(key, 0)
-                                >= cfg["cooldown"]
-                            ):
-                                send_hidden_gem(
-                                    symbol,
-                                    tf,
-                                    ev["dir"],
-                                    ev["kind"],
-                                    ev,
-                                    df,
-                                    phase_label=f"IMMEDIATA (score={hg_score:.2f})",
-                                )
-                                last_hg_bar_immediate[key] = last_key
-                                last_hg_immediate_time[key] = time.time()
+                            # NUOVO: Filtro BTC Correlation
+                            if not check_btc_correlation_filter(ev["dir"]):
+                                pass  # BTC in direzione opposta, skip
+                            else:
+                                # NUOVO: Filtro Funding Rate (solo per futures)
+                                funding = fetch_funding_rate(symbol)
+                                funding_ok = True
+                                if ev["dir"] == "long" and funding > 0.001:
+                                    funding_ok = False  # Troppi long, rischio squeeze
+                                elif ev["dir"] == "short" and funding < -0.001:
+                                    funding_ok = False  # Troppi short, rischio squeeze
+
+                                if funding_ok:
+                                    # NUOVO: Bonus/Malus orario
+                                    ora_utc = datetime.datetime.utcnow().hour
+                                    score_adj = hg_score
+                                    if ora_utc in ORARI_MIGLIORI_UTC:
+                                        score_adj += 0.03  # Bonus ore d'oro
+                                    elif ora_utc in ORARI_MEDIOCRI_UTC:
+                                        score_adj -= 0.05  # Penalità ore mediocri
+
+                                    if score_adj >= cfg["min_score"]:
+                                        last_key = (int(k.get("t", 0)), ev["dir"], tf)
+                                        key = f"{symbol}_{tf}"
+                                        if last_hg_bar_immediate.get(key) != last_key and (
+                                            time.time() - last_hg_immediate_time.get(key, 0)
+                                            >= cfg["cooldown"]
+                                        ):
+                                            send_hidden_gem(
+                                                symbol,
+                                                tf,
+                                                ev["dir"],
+                                                ev["kind"],
+                                                ev,
+                                                df,
+                                                phase_label=f"IMMEDIATA (score={score_adj:.2f})",
+                                            )
+                                            last_hg_bar_immediate[key] = last_key
+                                            last_hg_immediate_time[key] = time.time()
                 
             # Se la candela non è chiusa, fermati qui
             if not closed:
@@ -2365,6 +2610,17 @@ def update_realtime(symbol, tf, k):
                     if tf == "15m":
                         if get_trend(df) != ("rialzista" if ev["dir"] == "long" else "ribassista"):
                             continue
+                    # NUOVO: Filtro BTC Correlation per VALIDATA
+                    if not check_btc_correlation_filter(ev["dir"]):
+                        continue  # BTC in direzione opposta
+
+                    # NUOVO: Filtro Funding Rate per VALIDATA
+                    funding = fetch_funding_rate(symbol)
+                    if ev["dir"] == "long" and funding > 0.001:
+                        continue  # Troppi long
+                    if ev["dir"] == "short" and funding < -0.001:
+                        continue  # Troppi short
+
                     key = f"{symbol}_{tf}"
                     if (time.time() - last_hg_validated_time.get(key, 0) < cfg["cooldown"]):
                         continue
