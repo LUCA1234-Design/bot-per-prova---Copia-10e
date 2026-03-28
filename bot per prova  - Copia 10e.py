@@ -57,22 +57,22 @@ HG_ENABLED = True
 HG_MONITOR_ALL = True
 HG_TF = ["1h", "15m"]
 HG_TF_SECONDS = {"1h": 3600, "15m": 900}
-HG_COOLDOWN = 180
-HG_RVOL_PARTIAL_MIN = 2.0
-HG_RVOL_BAR_MIN = 1.3
-HG_SQUEEZE_MIN_BARS = 10
-HG_NR7_RVOL_MIN = 1.2
-HG_RS_SLOPE_MIN = 0.0014
+HG_COOLDOWN = 120
+HG_RVOL_PARTIAL_MIN = 3.5
+HG_RVOL_BAR_MIN = 2.5
+HG_SQUEEZE_MIN_BARS = 6
+HG_NR7_RVOL_MIN = 2.2
+HG_RS_SLOPE_MIN = 0.0022
 HG_LOOKBACK_RS = 48
 HG_LOOKBACK_HIGH = 20
 HG_SQZ_ON = True
 HG_NR7_ON = True
 HG_RS_ON = True
-HG_MIN_QUOTE_VOL = 70000 
+HG_MIN_QUOTE_VOL = 250000 
 HG_QVOL_LOOKBACK = 20
 HG_CFG = {
-    "1h": {"rvol_partial_min": 1.4, "rvol_bar_min": 1.3, "min_score": 0.65, "cooldown": HG_COOLDOWN},
-    "15m": {"rvol_partial_min": 2.3, "rvol_bar_min": 1.5, "min_score": 0.78, "cooldown": 300},
+    "1h": {"rvol_partial_min": 2.2, "rvol_bar_min": 2.2, "min_score": 0.82, "cooldown": 100},
+    "15m": {"rvol_partial_min": 3.0, "rvol_bar_min": 2.2, "min_score": 0.85, "cooldown": 75},
 }
 # Cooldown Segnali
 SIGNAL_COOLDOWN = 600
@@ -81,8 +81,8 @@ DIVERGENCE_MAX_AGE_HOURS = 4
 DIVERGENCE_MAX_AGE_CANDLES = 3
 DIVERGENCE_MAX_AGE_BY_TF = {"15m": 2, "1h": 2, "4h": 1}
 BREAKOUT_RULES = {
-    "1h": {"vol_min": 0.6, "break_mult": 1.001, "min_closes": 1, "atr_mult": 0.08},
-    "15m": {"vol_min": 0.6, "break_mult": 1.0004, "min_closes": 1, "atr_mult": 0.05},
+    "1h": {"vol_min": 1.5, "break_mult": 1.002, "min_closes": 1, "atr_mult": 0.08},
+    "15m": {"vol_min": 1.3, "break_mult": 1.001, "min_closes": 1, "atr_mult": 0.05},
 }
 ORARI_VIETATI_UTC  = list(range(2, 6))
 ORARI_MIGLIORI_UTC = list(range(8, 16)) + list(range(20, 24))
@@ -595,8 +595,8 @@ def divergence_rsi_v12_fixed(df, rsi_col="rsi", price_col="close", lookback=80):
             vals = series.iloc[extrema_indices].tolist()
             return idxs, vals
 
-        high_idx, high_vals = find_swings_local(prices, window=1, mode="high")
-        low_idx, low_vals = find_swings_local(prices, window=1, mode="low")
+        high_idx, high_vals = find_swings_local(prices, window=3, mode="high")
+        low_idx, low_vals = find_swings_local(prices, window=3, mode="low")
 
         if len(high_idx) < 2 and len(low_idx) < 2:
             return {
@@ -668,7 +668,7 @@ def divergence_rsi_v12_fixed(df, rsi_col="rsi", price_col="close", lookback=80):
             rsi_delta = abs(r2_v - r1_v)
 
             # ✅ Filtro divergenza troppo debole
-            if rsi_delta < 2.5:
+            if rsi_delta < 5.0:
                 return {
                     "rsi_advanced": "none",
                     "div_index": None,
@@ -698,7 +698,7 @@ def divergence_rsi_v12_fixed(df, rsi_col="rsi", price_col="close", lookback=80):
                 time_score = min(sep_candles, 12) / 12.0
                 rsi_quality = int(
                     max(
-                        0, min(100, 40 * rsi_score + 40 * price_score + 20 * time_score)
+                        0, min(100, 35 * rsi_score + 35 * price_score + 30 * time_score)
                     )
                 )
             except Exception:
@@ -1114,8 +1114,8 @@ def detect_squeeze_immediate(
     buy_ratio = taker_buy / v if v > 0 else 0.5
     
     # Logica Ignition: se c'è molta pressione (65%), accettiamo volume più basso (1.2)
-    is_ignition_long = (rvol_p >= 1.2 and buy_ratio > 0.65) or (rvol_p >= rvol_partial_min)
-    is_ignition_short = (rvol_p >= 1.2 and buy_ratio < 0.35) or (rvol_p >= rvol_partial_min)
+    is_ignition_long = (rvol_p >= 1.8 and buy_ratio > 0.72) or (rvol_p >= rvol_partial_min)
+    is_ignition_short = (rvol_p >= 1.8 and buy_ratio < 0.28) or (rvol_p >= rvol_partial_min)
     
     body_ratio = _body_ratio_from_bar(o, h, l, c)
     
@@ -1128,13 +1128,13 @@ def detect_squeeze_immediate(
     upper_band = float(bbu.iloc[-1])
     lower_band = float(bbl.iloc[-1])
 
-    # Accettiamo candele anche in formazione se hanno un corpo decente (40%)
-    if body_ratio >= 0.40: 
+    # Accettiamo candele anche in formazione se hanno un corpo decente (55%)
+    if body_ratio >= 0.55: 
         
         # --- LONG ---
         if c > upper_band and is_ignition_long:
-            # FILTRO WICK LONG: Se l'ombra sopra è > 20% del corpo, è una finta.
-            if body_size > 0 and (upper_wick / body_size) > 0.20:
+            # FILTRO WICK LONG: Se l'ombra sopra è > 12% del corpo, è una finta.
+            if body_size > 0 and (upper_wick / body_size) > 0.12:
                 return None # BLOCCA: Resistenza forte
                 
             return {
@@ -1148,8 +1148,8 @@ def detect_squeeze_immediate(
 
         # --- SHORT ---
         if c < lower_band and is_ignition_short:
-            # FILTRO WICK SHORT: Se l'ombra sotto è > 20% del corpo, è una finta.
-            if body_size > 0 and (lower_wick / body_size) > 0.20:
+            # FILTRO WICK SHORT: Se l'ombra sotto è > 12% del corpo, è una finta.
+            if body_size > 0 and (lower_wick / body_size) > 0.12:
                 return None # BLOCCA: Supporto forte
                 
             return {
@@ -1179,7 +1179,7 @@ def detect_squeeze_validated(df: pd.DataFrame, rvol_bar_min=HG_RVOL_BAR_MIN):
     l = df["low"].iloc[-1]
     body_ratio = _body_ratio_from_bar(o, h, l, c)
     _, rvol = get_rvol_state(df)
-    if rvol >= rvol_bar_min and body_ratio >= 0.65:
+    if rvol >= rvol_bar_min and body_ratio >= 0.78:
         if c > float(bbu.iloc[-1]):
             return {
                 "dir": "long",
@@ -1258,15 +1258,15 @@ def _estimate_hg_score(features: dict, df: pd.DataFrame, direction: str) -> floa
         body = float(features.get("body_ratio", 0.0))
         rs_slope = float(features.get("rs_slope", 0.0))
         p = 0.0
-        if rvol >= 3.0:
+        if rvol >= 4.5:
             p += 0.35
+        elif rvol >= 3.0:
+            p += 0.25
         elif rvol >= 2.0:
-            p += 0.25
-        elif rvol >= 1.5:
             p += 0.15
-        if body >= 0.75:
+        if body >= 0.82:
             p += 0.25
-        elif body >= 0.60:
+        elif body >= 0.70:
             p += 0.15
         if get_trend(df) == ("rialzista" if direction == "long" else "ribassista"):
             p += 0.20
@@ -1992,7 +1992,7 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
     score = 0.0
     rvol = float(features.get("rvol", 1.0))
     score += min((rvol - 1.0) / 3.0, 0.35) if rvol > 1 else 0.0
-    score += 0.15 if features.get("body_ratio", 0) >= 0.6 else 0.0
+    score += 0.15 if features.get("body_ratio", 0) >= 0.75 else 0.0
     score += 0.20 if features.get("rs_slope", 0) >= HG_RS_SLOPE_MIN else 0.0
     
     ai_forza = "media"
@@ -2003,9 +2003,9 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
             ai_ctx = build_ai_context_simple(symbol, tf, direction, kind, features, df, entry, sl, tp1, tp2, tp3)
             ai_res = call_ai_safe(symbol, tf, score, direction, ai_ctx)
             
-            # SOGLIA CECCHINO: Scarta i segnali con successo < 75 o se l'AI dice che è "debole"
-            if int(ai_res.get('successo', 0)) < 75 or ai_res.get('forza', 'media').lower() == 'debole':
-                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (Segnale debole o sotto 75%).")
+            # SOGLIA CECCHINO: Scarta i segnali con successo < 80 o se l'AI non dice "forte"
+            if int(ai_res.get('successo', 0)) < 80 or ai_res.get('forza', 'media').lower() != 'forte':
+                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (Segnale debole o sotto 80%).")
                 return 
 
             commento_ai = ai_res.get('commento', '')
@@ -2023,7 +2023,7 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
         else: forza_label = "🟡 MEDIA"
     else:
         # Fallback matematico se l'AI è spenta
-        if score >= 0.60: forza_label = "🟢 FORTE"
+        if score >= 0.75: forza_label = "🟢 FORTE"
         else: forza_label = "🟡 MEDIA"
 
     emoji_dir = "🚀" if direction == "long" else "🔻"
@@ -2103,6 +2103,8 @@ def process_closed_candle(symbol, tf, k):
         div_index = div_state.get("div_index", None)
         
         if div_type == "none" or div_index is None: return 
+        if div_state.get("rsi_quality", 0) < 45:
+            return  # Divergenza troppo debole, scarta
         if not is_good_trading_hour(): return
         
         if div_type.startswith("bullish"): direction = "long"
@@ -2303,39 +2305,51 @@ def update_realtime(symbol, tf, k):
             # Hidden Gems IMMEDIATA intrabar
             # =========================================================
             if not closed and tf in HG_TF and HG_ENABLED:
-                cfg = HG_CFG.get(tf, HG_CFG["1h"])
-                ev = detect_squeeze_immediate(
-                    df,
-                    k,
-                    rvol_partial_min=cfg["rvol_partial_min"],
-                    tf_seconds=HG_TF_SECONDS.get(tf, 3600),
-                )
-                if ev:
-                    hg_score = _estimate_hg_score(ev, df, ev["dir"])
-                    if hg_score >= cfg["min_score"]:
-                        trend_ok = True
-                        if tf == "15m":
-                            trend_ok = get_trend(df) == (
-                                "rialzista" if ev["dir"] == "long" else "ribassista"
-                            )
-                        if trend_ok:
-                            last_key = (int(k.get("t", 0)), ev["dir"], tf)
-                            key = f"{symbol}_{tf}"
-                            if last_hg_bar_immediate.get(key) != last_key and (
-                                time.time() - last_hg_immediate_time.get(key, 0)
-                                >= cfg["cooldown"]
-                            ):
-                                send_hidden_gem(
-                                    symbol,
-                                    tf,
-                                    ev["dir"],
-                                    ev["kind"],
-                                    ev,
-                                    df,
-                                    phase_label=f"IMMEDIATA (score={hg_score:.2f})",
-                                )
-                                last_hg_bar_immediate[key] = last_key
-                                last_hg_immediate_time[key] = time.time()
+                # NUOVO: Filtro Market Regime - blocca segnali in mercato EXPLOSIVE
+                regime = get_market_regime(df)
+                if regime == "EXPLOSIVE":
+                    pass  # Skip: mercato troppo volatile per HG
+                else:
+                    cfg = HG_CFG.get(tf, HG_CFG["1h"])
+                    ev = detect_squeeze_immediate(
+                        df,
+                        k,
+                        rvol_partial_min=cfg["rvol_partial_min"],
+                        tf_seconds=HG_TF_SECONDS.get(tf, 3600),
+                    )
+                    if ev:
+                        hg_score = _estimate_hg_score(ev, df, ev["dir"])
+                        if hg_score >= cfg["min_score"]:
+                            trend_ok = True
+                            if tf == "15m":
+                                # MIGLIORATO: Multi-timeframe check - verifica trend 1h
+                                df_1h = historical_data.get(symbol, {}).get("1h")
+                                if df_1h is not None and len(df_1h) > 50:
+                                    trend_1h = get_trend(df_1h)
+                                    regime_1h = get_market_regime(df_1h)
+                                    trend_ok = trend_1h == ("rialzista" if ev["dir"] == "long" else "ribassista")
+                                    if regime_1h == "EXPLOSIVE":
+                                        trend_ok = False
+                                else:
+                                    trend_ok = get_trend(df) == ("rialzista" if ev["dir"] == "long" else "ribassista")
+                            if trend_ok:
+                                last_key = (int(k.get("t", 0)), ev["dir"], tf)
+                                key = f"{symbol}_{tf}"
+                                if last_hg_bar_immediate.get(key) != last_key and (
+                                    time.time() - last_hg_immediate_time.get(key, 0)
+                                    >= cfg["cooldown"]
+                                ):
+                                    send_hidden_gem(
+                                        symbol,
+                                        tf,
+                                        ev["dir"],
+                                        ev["kind"],
+                                        ev,
+                                        df,
+                                        phase_label=f"IMMEDIATA (score={hg_score:.2f})",
+                                    )
+                                    last_hg_bar_immediate[key] = last_key
+                                    last_hg_immediate_time[key] = time.time()
                 
             # Se la candela non è chiusa, fermati qui
             if not closed:
@@ -2351,34 +2365,49 @@ def update_realtime(symbol, tf, k):
             # Hidden Gems VALIDATA (a chiusura)
             if tf in HG_TF and HG_ENABLED:
                 cfg = HG_CFG.get(tf, HG_CFG["1h"])
-                ev1 = detect_squeeze_validated(df, rvol_bar_min=cfg["rvol_bar_min"])
-                ev2 = detect_nr7_validated(
-                    df, rvol_min=max(HG_NR7_RVOL_MIN, cfg["rvol_bar_min"])
-                )
-                ev3 = (
-                    detect_rs_leader_breakout(symbol, df) if tf == "1h" else None
-                )  # RS solo 1h
-                
-                for ev in [ev1, ev2, ev3]:
-                    if not ev:
-                        continue
-                    if tf == "15m":
-                        if get_trend(df) != ("rialzista" if ev["dir"] == "long" else "ribassista"):
-                            continue
-                    key = f"{symbol}_{tf}"
-                    if (time.time() - last_hg_validated_time.get(key, 0) < cfg["cooldown"]):
-                        continue
-                        
-                    send_hidden_gem(
-                        symbol,
-                        tf,
-                        ev["dir"],
-                        ev["kind"],
-                        ev,
-                        df,
-                        phase_label="VALIDATA",
+                # NUOVO: Filtro Market Regime per VALIDATA
+                regime = get_market_regime(df)
+                if regime == "EXPLOSIVE":
+                    pass  # Skip VALIDATA in mercato esplosivo
+                else:
+                    ev1 = detect_squeeze_validated(df, rvol_bar_min=cfg["rvol_bar_min"])
+                    ev2 = detect_nr7_validated(
+                        df, rvol_min=max(HG_NR7_RVOL_MIN, cfg["rvol_bar_min"])
                     )
-                    last_hg_validated_time[key] = time.time()
+                    ev3 = (
+                        detect_rs_leader_breakout(symbol, df) if tf == "1h" else None
+                    )  # RS solo 1h
+                    
+                    for ev in [ev1, ev2, ev3]:
+                        if not ev:
+                            continue
+                        if tf == "15m":
+                            # MIGLIORATO: Multi-timeframe check - verifica trend 1h e regime 1h
+                            df_1h = historical_data.get(symbol, {}).get("1h")
+                            if df_1h is not None and len(df_1h) > 50:
+                                trend_1h = get_trend(df_1h)
+                                regime_1h = get_market_regime(df_1h)
+                                if trend_1h != ("rialzista" if ev["dir"] == "long" else "ribassista"):
+                                    continue
+                                if regime_1h == "EXPLOSIVE":
+                                    continue
+                            else:
+                                if get_trend(df) != ("rialzista" if ev["dir"] == "long" else "ribassista"):
+                                    continue
+                        key = f"{symbol}_{tf}"
+                        if (time.time() - last_hg_validated_time.get(key, 0) < cfg["cooldown"]):
+                            continue
+                            
+                        send_hidden_gem(
+                            symbol,
+                            tf,
+                            ev["dir"],
+                            ev["kind"],
+                            ev,
+                            df,
+                            phase_label="VALIDATA",
+                        )
+                        last_hg_validated_time[key] = time.time()
 
         except Exception as e:
             logger.error(f"Errore update_realtime {symbol} {tf}: {e}")
