@@ -71,15 +71,15 @@ HG_RS_ON = True
 HG_MIN_QUOTE_VOL = 70000 
 HG_QVOL_LOOKBACK = 20
 HG_CFG = {
-    "1h": {"rvol_partial_min": 1.4, "rvol_bar_min": 1.3, "min_score": 0.65, "cooldown": HG_COOLDOWN},
-    "15m": {"rvol_partial_min": 2.3, "rvol_bar_min": 1.5, "min_score": 0.78, "cooldown": 300},
+    "1h": {"rvol_partial_min": 1.4, "rvol_bar_min": 1.3, "min_score": 0.70, "cooldown": HG_COOLDOWN},
+    "15m": {"rvol_partial_min": 2.3, "rvol_bar_min": 1.5, "min_score": 0.82, "cooldown": 300},
 }
 # Cooldown Segnali
 SIGNAL_COOLDOWN = 600
 SIGNAL_COOLDOWN_BY_TF = {"15m": 300, "1h": 600, "4h": 3600}
 DIVERGENCE_MAX_AGE_HOURS = 4
 DIVERGENCE_MAX_AGE_CANDLES = 3
-DIVERGENCE_MAX_AGE_BY_TF = {"15m": 2, "1h": 2, "4h": 1}
+DIVERGENCE_MAX_AGE_BY_TF = {"15m": 5, "1h": 6, "4h": 3}
 BREAKOUT_RULES = {
     "1h": {"vol_min": 0.6, "break_mult": 1.001, "min_closes": 1, "atr_mult": 0.08},
     "15m": {"vol_min": 0.6, "break_mult": 1.0004, "min_closes": 1, "atr_mult": 0.05},
@@ -428,160 +428,6 @@ def round_to(value, step):
 # ============================
 # 🏛️ REGIME DETECTION PROBABILISTICO (IL GENERALE)
 # ============================
-def get_trend(df):
-    try:
-        if df is None or len(df) < 50: return "laterale"
-        ema50 = df['close'].ewm(span=50).mean()
-        ema200 = df['close'].ewm(span=200).mean()
-        if ema50.iloc[-1] > ema200.iloc[-1] * 1.002: return "rialzista"
-        if ema50.iloc[-1] < ema200.iloc[-1] * 0.998: return "ribassista"
-        return "laterale"
-    except: return "laterale"
-
-def get_probabilistic_regime(df):
-    """V15: Calcola la probabilità dei 4 regimi (Trend, Range, Shock)."""
-    try:
-        if df is None or len(df) < 50: return "MEAN_REVERSION", {}
-        adx = calc_adx(df)
-        ema50 = df['close'].ewm(span=50).mean()
-        ema200 = df['close'].ewm(span=200).mean()
-        m, bbu, bbl, bbw = _bbands(df['close'])
-        ke, kcu, kcl, kcw = _keltner(df)
-        vol_ratio = (bbw / kcw.replace(0, 0.0001)).iloc[-1]
-        z_score = calculate_z_score_series(df['close']).iloc[-1]
-        
-        scores = {"LONG_TREND": 0, "SHORT_TREND": 0, "MEAN_REVERSION": 0, "SHOCK": 0}
-
-        # Logica Punti
-        if adx > 25: 
-            if ema50.iloc[-1] > ema200.iloc[-1]: scores["LONG_TREND"] += 30
-            else: scores["SHORT_TREND"] += 30
-        
-        if vol_ratio > 1.8 or abs(z_score) > 3.0: scores["SHOCK"] += 60
-        if adx < 20 and vol_ratio < 1.0: scores["MEAN_REVERSION"] += 50
-
-        return max(scores, key=scores.get), scores
-    except: return "MEAN_REVERSION", {}
-
-def get_rvol_state(df, lookback=20):
-    try:
-        vol = df["volume"].fillna(0)
-        ma = vol.rolling(lookback).mean()
-        rvol = vol.iloc[-1] / ma.iloc[-1] if ma.iloc[-1] > 0 else 1.0
-        return "normale", rvol
-    except: return "sconosciuto", 1.0
-
-def get_symbol_quality(df):
-    """Qualità del simbolo basata su RVOL + ATR ratio + liquidità."""
-    try:
-        if df is None or len(df) < 50:
-            return -5
-        _, rvol = get_rvol_state(df)
-        atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
-        price = float(df["close"].iloc[-1])
-        if price <= 0:
-            return -5
-        atr_ratio = atr / price
-        score = 0
-        if 1.5 <= rvol <= 4.0: score += 5
-        elif 1.0 <= rvol < 1.5: score += 3
-        elif rvol < 0.7: score -= 3
-        if 0.002 <= atr_ratio <= 0.02: score += 5
-        elif 0.001 <= atr_ratio < 0.002: score += 2
-        elif atr_ratio < 0.0008: score -= 4
-        vol_avg = float(df["volume"].tail(20).mean())
-        if vol_avg > 1000000: score += 3
-        elif vol_avg > 100000: score += 1
-        else: score -= 2
-        return max(min(score, 10), -10)
-    except Exception:
-        return 0
-
-def get_regime_symbol(df):
-    """Classifica il regime del singolo simbolo."""
-    try:
-        if df is None or len(df) < 50:
-            return "neutro"
-        close = df["close"].dropna()
-        if len(close) < 50:
-            return "neutro"
-        ema50 = close.ewm(span=50).mean()
-        ema200 = close.ewm(span=200).mean()
-        if ema50.iloc[-1] > ema200.iloc[-1] * 1.005:
-            return "bull"
-        if ema50.iloc[-1] < ema200.iloc[-1] * 0.995:
-            return "bear"
-        return "neutro"
-    except Exception:
-        return "neutro"
-
-def get_global_regime():
-    """Regime globale basato su BTC + ETH combinati."""
-    try:
-        btc = historical_data.get("BTCUSDT", {}).get("1h")
-        eth = historical_data.get("ETHUSDT", {}).get("1h")
-        r_btc = get_regime_symbol(btc)
-        r_eth = get_regime_symbol(eth)
-        if r_btc == "bull" and r_eth == "bull":
-            return "bull"
-        if r_btc == "bear" and r_eth == "bear":
-            return "bear"
-        return "neutro"
-    except Exception:
-        return "neutro"
-
-def get_risk_regime_btc_eth():
-    """Risk regime basato su RSI + OBV + ATR di BTC e ETH."""
-    try:
-        btc = historical_data.get("BTCUSDT", {}).get("1h")
-        eth = historical_data.get("ETHUSDT", {}).get("1h")
-        if btc is None or eth is None:
-            return "neutral"
-        def _score(d):
-            try:
-                rsi = float(d["rsi"].iloc[-1]) if "rsi" in d.columns else 50
-                obv_slope = (float(d["obv"].iloc[-1]) - float(d["obv"].iloc[-5])) if "obv" in d.columns and len(d) > 5 else 0
-                atr = float(d["atr"].iloc[-1]) if "atr" in d.columns else 0
-                price = float(d["close"].iloc[-1])
-                atr_ratio = atr / price if price > 0 else 0
-                s = 0
-                if rsi > 55: s += 1
-                if obv_slope > 0: s += 1
-                if atr_ratio > 0.01: s += 1
-                if rsi < 45: s -= 1
-                if obv_slope < 0: s -= 1
-                if atr_ratio < 0.004: s -= 1
-                return s
-            except: return 0
-        total = _score(btc) + _score(eth)
-        if total >= 3: return "risk_on"
-        if total <= -3: return "risk_off"
-        return "neutral"
-    except Exception:
-        return "neutral"
-
-def get_divergence_direction(div_type): 
-    if "bull" in div_type: return "bull"
-    if "bear" in div_type: return "bear"
-    return "none"
-
-def get_multi_tf_divergence_state(symbol):
-    """Combina lo stato divergenze su 15m, 1h, 4h."""
-    try:
-        result = {}
-        if symbol not in divergence_state:
-            return result
-        for tf in ["15m", "1h", "4h"]:
-            div = divergence_state.get(symbol, {}).get(tf, {})
-            if div.get("rsi_advanced", "none") != "none":
-                result[tf] = {
-                    "type": div["rsi_advanced"],
-                    "quality": div.get("rsi_quality", 0),
-                    "early": div.get("div_early", "none"),
-                }
-        return result
-    except Exception:
-        return {}
 
 # ============================
 # 🔬 MICROSTRUCTURE ENGINE
@@ -1004,7 +850,7 @@ def call_ai_safe(symbol, tf, pre_score, direction, context, role="analyst"):
             clean = re.search(r'\{.*\}', raw, re.DOTALL).group()
             data = json.loads(clean)
         except:
-            return {"successo": 55, "forza": "media", "commento": "AI Parsing Error", "score": 50}
+            return {"successo": 65, "forza": "media", "commento": "AI Parsing Error", "score": 50}
 
         # FUNZIONE ANTI-PROIETTILE PER NUMERI (Pulisce %, lettere e spazi)
         def safe_int(value, default_val):
@@ -1034,7 +880,7 @@ def call_ai_safe(symbol, tf, pre_score, direction, context, role="analyst"):
         return {
             "forza": "media",
             "commento": "Fallback: AI non disponibile.",
-            "successo": 55,
+            "successo": 65,
             "score": 50
         }
 
@@ -1328,43 +1174,27 @@ def update_divergences(symbol, tf):
 
 def scan_divergences_on_startup():
     try:
-        logger.info("✅ Storico caricato - Divergenze calcolate solo su nuove candele")
+        logger.info("🔍 Calcolo divergenze iniziali sullo storico...")
+        count = 0
         for symbol in symbols_whitelist:
-            divergence_state[symbol] = {
-                "1h": {
-                    "rsi_advanced": "none",
-                    "div_index": None,
-                    "breakline_price": None,
-                    "div_early": "none",
-                    "div_early_quality": 0,
-                    "points": {},
-                    "rsi_quality": 0,
-                },
-                "4h": {
-                    "rsi_advanced": "none",
-                    "div_index": None,
-                    "breakline_price": None,
-                    "div_early": "none",
-                    "div_early_quality": 0,
-                    "points": {},
-                    "rsi_quality": 0,
-                },
-                "15m": {
-                    "rsi_advanced": "none",
-                    "div_index": None,
-                    "breakline_price": None,
-                    "div_early": "none",
-                    "div_early_quality": 0,
-                    "points": {},
-                    "rsi_quality": 0,
-                },
-            }
+            divergence_state[symbol] = {}
+            for tf in ["15m", "1h", "4h"]:
+                df = historical_data.get(symbol, {}).get(tf)
+                if df is not None and len(df) >= 50:
+                    div = divergence_rsi_v12_fixed(df)
+                    divergence_state[symbol][tf] = div
+                    if div.get("rsi_advanced", "none") != "none":
+                        count += 1
+                        logger.info(f"  📊 {symbol} {tf}: {div['rsi_advanced']} (quality={div.get('rsi_quality', 0)})")
+                else:
+                    divergence_state[symbol][tf] = {
+                        "rsi_advanced": "none", "div_index": None, "breakline_price": None,
+                        "div_early": "none", "div_early_quality": 0, "points": {}, "rsi_quality": 0,
+                    }
         while not signal_queue.empty():
-            try:
-                signal_queue.get_nowait()
-            except:
-                break
-        logger.info("🎯 Bot pronto - In attesa divergenze FRESCHE su nuove candele 1H")
+            try: signal_queue.get_nowait()
+            except: break
+        logger.info(f"🎯 Divergenze iniziali trovate: {count} — Bot pronto")
     except Exception as e:
         logger.error(f"Errore scan_divergences_on_startup: {e}")
 
@@ -2735,9 +2565,9 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
             ai_ctx = build_ai_context_simple(symbol, tf, direction, kind, features, df, entry, sl, tp1, tp2, tp3)
             ai_res = call_ai_safe(symbol, tf, score, direction, ai_ctx)
             
-            # SOGLIA CECCHINO: Scarta i segnali con successo < 75 o se l'AI dice che è "debole"
-            if int(ai_res.get('successo', 0)) < 75 or ai_res.get('forza', 'media').lower() == 'debole':
-                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (Segnale debole o sotto 75%).")
+            # SOGLIA CECCHINO: Scarta i segnali con successo < 60
+            if int(ai_res.get('successo', 0)) < 60:
+                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (sotto 60%).")
                 return 
 
             commento_ai = ai_res.get('commento', '')
@@ -2867,6 +2697,9 @@ def process_closed_candle(symbol, tf, k):
         
         if div_type == "none" or div_index is None: return 
         if not is_good_trading_hour(): return
+
+        if div_type != "none":
+            logger.info(f"🔬 [{symbol}] {tf} Divergenza trovata: {div_type} | quality={div_state.get('rsi_quality',0)} | index={div_index}")
         
         if div_type.startswith("bullish"): direction = "long"
         elif div_type.startswith("bearish"): direction = "short"
@@ -2875,15 +2708,22 @@ def process_closed_candle(symbol, tf, k):
         max_age = DIVERGENCE_MAX_AGE_BY_TF.get(tf, 3)
         if not is_recent_divergence(div_index, df, max_candles=max_age): return
 
+        # Filtro qualità divergenza: solo divergenze con delta RSI significativo
+        rsi_quality = div_state.get("rsi_quality", 0)
+        if rsi_quality < 35:
+            logger.debug(f"[{symbol}] Divergenza scartata: rsi_quality={rsi_quality} < 35")
+            return
+
         # NUOVO: Richiedi conferma MACD divergence
         macd_div = detect_macd_divergence(df)
         rsi_div_dir = div_state.get("rsi_advanced", "none")
 
         # Se c'è divergenza RSI bullish, verifica che anche MACD confermi (o almeno non contraddica)
-        if rsi_div_dir.startswith("bullish") and macd_div == "bearish":
-            return  # RSI dice bullish ma MACD dice bearish → contraddizione, scarta
-        if rsi_div_dir.startswith("bearish") and macd_div == "bullish":
-            return  # RSI dice bearish ma MACD dice bullish → contraddizione, scarta
+        # MACD contraddizione: non blocca più, diventa penalità nel log
+        macd_contradicts = (rsi_div_dir.startswith("bullish") and macd_div == "bearish") or \
+                           (rsi_div_dir.startswith("bearish") and macd_div == "bullish")
+        if macd_contradicts:
+            logger.info(f"⚠️ [{symbol}] MACD contraddice RSI — penalità applicata ma non bloccato")
 
         # BONUS: Se entrambi concordano, il segnale è molto più forte
         macd_confirms = (rsi_div_dir.startswith("bullish") and macd_div == "bullish") or \
@@ -2904,9 +2744,9 @@ def process_closed_candle(symbol, tf, k):
         # FILTRO Z-SCORE ADATTIVO (Il cuore del Cecchino)
         z_curr = calculate_z_score_series(df["close"]).iloc[-1]
         
-        # Se il mercato è laterale, vogliamo estremi ASSOLUTI (>2.0 o <-2.0)
-        # Se il mercato è in trend, accettiamo pullback normali (>0.0)
-        z_threshold = 2.0 if current_regime == "MEAN_REVERSION" else 0.0
+        # Se il mercato è laterale, vogliamo estremi moderati (>1.2 o <-1.2)
+        # Se il mercato è in trend, accettiamo pullback normali (>0.5)
+        z_threshold = 1.2 if current_regime == "MEAN_REVERSION" else 0.5
         
         if direction == "long" and z_curr > -z_threshold: return # Prezzo non abbastanza basso
         if direction == "short" and z_curr < z_threshold: return # Prezzo non abbastanza alto
@@ -2915,7 +2755,7 @@ def process_closed_candle(symbol, tf, k):
         if AI_ENABLED:
             scout_ctx = f"Regime: {current_regime}, Z: {z_curr:.2f}, Trend: {get_trend(df)}"
             res_scout = call_ai_safe(symbol, tf, 0, direction, scout_ctx, role="scout")
-            if int(res_scout.get("successo", 0)) < 65:
+            if int(res_scout.get("successo", 0)) < 45:
                 logger.info(f"⛔ SCOUT VETO: {res_scout.get('commento')}")
                 return
 
@@ -2944,9 +2784,9 @@ def process_closed_candle(symbol, tf, k):
             analyst_ctx = f"SNIPER SETUP. Regime: {current_regime}. RR: {rr_ratio:.2f}. Z-Score: {z_curr:.2f}. Kelly: {kelly_pct:.1f}%"
             res_analyst = call_ai_safe(symbol, tf, 0, direction, analyst_ctx, role="analyst")
             
-            # SOGLIA CECCHINO ABBASSATA A 60: Permette di ricevere anche i segnali DEBOLI
-            if int(res_analyst.get("successo", 0)) < 60:
-                logger.info(f"⛔ ANALYST VETO (<60%): {res_analyst.get('commento')}")
+            # SOGLIA ABBASSATA A 50: Permette di ricevere anche i segnali DEBOLI
+            if int(res_analyst.get("successo", 0)) < 50:
+                logger.info(f"⛔ ANALYST VETO (<50%): {res_analyst.get('commento')}")
                 return
                 
             ai_comm = res_analyst.get("commento", "")
@@ -2965,6 +2805,17 @@ def process_closed_candle(symbol, tf, k):
         msg += f"⚛️ Z-Score: `{z_curr:.2f}` (Adattivo)\n"
         msg += f"💰 Kelly Size: `{kelly_usdt:.0f} USDT` ({kelly_pct:.1f}%)\n"
         msg += f"💪 *Forza Segnale:* {forza_label}\n\n"
+
+        # Multi-TF info
+        mtf = get_multi_tf_divergence_state(symbol)
+        mtf_info = ""
+        if mtf.get("conferma_4h"): mtf_info += "✅ 4H conferma | "
+        if mtf.get("conferma_15m"): mtf_info += "✅ 15m conferma | "
+        if macd_confirms: mtf_info += "✅ MACD conferma | "
+        if macd_contradicts: mtf_info += "⚠️ MACD contrario | "
+        if mtf_info:
+            msg += f"🔗 Multi-TF: {mtf_info.rstrip(' | ')}\n"
+        msg += f"📊 RSI Quality: {div_state.get('rsi_quality', 0)}/100\n\n"
         
         msg += "🎯 *LIVELLI OPERATIVI*\n"
         if entry and sl and tp1 and tp2 and tp3:
@@ -3138,8 +2989,8 @@ def update_realtime(symbol, tf, k):
                                                         logger.info(f"🔬 [MICRO] {symbol} bloccato: score={micro_det.get('micro_score')}")
                                                     else:
                                                         prob = calculate_signal_probability(df, ev["dir"], ev, regime_now, tf)
-                                                        if prob < 0.72:
-                                                            logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 72%")
+                                                        if prob < 0.60:
+                                                            logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 60%")
                                                         else:
                                                             # ALL GATES PASSED → SEND
                                                             send_hidden_gem(
@@ -3211,8 +3062,8 @@ def update_realtime(symbol, tf, k):
                         logger.info(f"🔬 [MICRO] {symbol} bloccato: score={micro_det.get('micro_score')}")
                         continue
                     prob = calculate_signal_probability(df, ev["dir"], ev, regime_now, tf)
-                    if prob < 0.72:
-                        logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 72%")
+                    if prob < 0.60:
+                        logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 60%")
                         continue
 
                     # ALL GATES PASSED → SEND
@@ -3232,56 +3083,8 @@ def update_realtime(symbol, tf, k):
             traceback.print_exc()
 
 
-# ============================
-# WEBSOCKET CALLBACKS
-# ============================
 
 
-def on_message(ws, message):
-    try:
-        data = json.loads(message)
-        payload = data.get("data", {})
-        if "k" not in payload:
-            return
-        k = payload["k"]
-        symbol = k["s"]
-        interval = k["i"]
-        if interval not in ("1h", "4h", "15m"):
-            return
-        tf = interval
-        update_realtime(symbol, tf, k)
-        name = getattr(ws, "name", "WS")
-        now = time.time()
-        with LAST_MESSAGE_LOCK:
-            LAST_MESSAGE_TIME[name] = now
-        WS_HEALTH[name] = {"alive": True, "last_msg": now}
-        if k.get("x") is True:
-            if tf == "1h":
-                logger.debug(f"[CANDLE-CLOSED] {symbol} {tf}")
-            process_closed_candle(symbol, tf, k)
-    except Exception as e:
-        logger.error(f"Errore on_message: {e}")
-        traceback.print_exc()
-
-
-def on_error(ws, error):
-    name = getattr(ws, "name", "WS")
-    logger.error(f"[{name}] WS error: {error}")
-
-
-def on_close(ws, close_status_code, close_msg):
-    name = getattr(ws, "name", "WS")
-    logger.warning(f"[{name}] WS chiuso: {close_status_code} {close_msg}")
-
-
-def on_open(ws):
-    name = getattr(ws, "name", "WS")
-    logger.info(f"[{name}] WS aperto")
-
-
-# ============================
-# WEBSOCKET MANAGER
-# ============================
 
 WS_RECONNECT_MIN = 5
 WS_RECONNECT_MAX = 120
@@ -3292,24 +3095,6 @@ STREAM_TIMEOUT = 25
 HEARTBEAT_INTERVAL = 30
 WS_REBALANCE_LOCK = threading.Lock()
 
-
-def ws_health_report():
-    try:
-        rep = []
-        now = time.time()
-        for name, data in WS_HEALTH.items():
-            last_msg = data.get("last_msg", 0)
-            alive = data.get("alive", False)
-            fails = WS_FAILCOUNT.get(name, 0)
-            age = int(now - last_msg)
-            rep.append(f"{name}: alive={alive}, last={age}s, fails={fails}")
-        if rep:
-            logger.info("📊 WS HEALTH:\n" + "\n".join(rep))
-        else:
-            logger.info("📊 WS HEALTH: nessun WS registrato.")
-    except Exception as e:
-        logger.error(f"[WS-HEALTH] Errore: {e}")
-        traceback.print_exc()
 
 
 def watchdog(ws, name):
@@ -3341,59 +3126,6 @@ def heartbeat(name):
             logger.error(f"[{name}-HEARTBEAT] Errore: {e}")
             traceback.print_exc()
             return
-
-
-def start_ws_for_tf(tf):
-    num_ws = TF_CONFIG.get(tf, {}).get("num_ws", 10)
-    symbols_list = get_symbols_for_tf(tf)
-    group_size = max(1, math.ceil(max(1, len(symbols_list)) / num_ws))
-    groups = split_symbols_v4(tf, group_size=group_size, symbols=symbols_list)
-    
-    for i, group in enumerate(groups):
-        if not group: continue
-        name = f"WS_{tf}_{i+1}"
-        url = build_stream_url_v4(group, tf)
-        logger.info(f"[WS-INIT] {name} -> {len(group)} simboli")
-        WS_HEALTH[name] = {"alive": False, "last_msg": time.time()}
-
-        def _run_ws(url=url, name=name):
-            threading.current_thread().name = name
-            while True:
-                try:
-                    ws = websocket.WebSocketApp(
-                        url, 
-                        on_message=on_message, 
-                        on_error=on_error, 
-                        on_close=on_close, 
-                        on_open=on_open
-                    )
-                    ws.name = name
-                    # V16 STABILITY FIX: Ping 0 (Passivo) + SSL None (Compatibilità)
-                    ws.run_forever(
-                        ping_interval=0, 
-                        ping_timeout=None, 
-                        sslopt={"cert_reqs": ssl.CERT_NONE}
-                    )
-                except Exception as e:
-                    logger.error(f"[{name}] Err: {e}")
-                    time.sleep(5)
-                time.sleep(5)
-
-        t = threading.Thread(target=_run_ws, daemon=True, name=name)
-        t.start()
-
-
-def start_multi_websocket_v4():
-    for tf in TF_CONFIG.keys():
-        start_ws_for_tf(tf)
-
-    def _health_loop():
-        while True:
-            time.sleep(300)
-            ws_health_report()
-
-    threading.Thread(target=_health_loop, daemon=True, name="WS-HEALTH-LOOP").start()
-
 
 
 
