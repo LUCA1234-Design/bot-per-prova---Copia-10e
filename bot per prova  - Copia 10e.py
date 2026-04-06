@@ -159,6 +159,7 @@ WS_HEALTH = {}
 WS_FAILCOUNT = {}
 LAST_MESSAGE_TIME = {}
 LAST_MESSAGE_LOCK = threading.Lock()
+WS_STALE_TIMEOUT = 60  # Secondi senza messaggi prima che il watchdog riavvii il WS
 ACTIVE_HEARTBEATS = set()
 LOGBOOK_FILE = "signals_log_v15.csv"
 LOGBOOK_LOCK = threading.Lock()
@@ -3317,6 +3318,29 @@ def on_close(ws, c, m): logger.warning(f"WS Closed: {c} {m}")
 def on_open(ws): logger.info(f"WS Open")
 
 # --- WEBSOCKET MANAGER ---
+
+def watchdog(ws, name, stale_timeout=None):
+    """Monitora un WebSocket e lo riavvia se si blocca (nessun messaggio per stale_timeout secondi)."""
+    if stale_timeout is None:
+        stale_timeout = WS_STALE_TIMEOUT
+    try:
+        time.sleep(30)  # Grace period iniziale per permettere la connessione
+        while True:
+            time.sleep(15)  # Check ogni 15 secondi
+            with LAST_MESSAGE_LOCK:
+                last = LAST_MESSAGE_TIME.get(name, 0)
+            if last == 0:
+                continue  # Non ha ancora ricevuto messaggi, aspetta
+            elapsed = time.time() - last
+            if elapsed > stale_timeout:
+                logger.warning(f"🐕 [WATCHDOG] {name} stallo rilevato ({elapsed:.0f}s senza messaggi) → riavvio forzato")
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                break  # Il loop in _run_ws ricreerà il WS
+    except Exception as e:
+        logger.error(f"🐕 [WATCHDOG] {name} errore: {e}")
 
 def start_ws_for_tf(tf):
     num_ws = {"1h": 10, "4h": 6, "15m": 12}.get(tf, 10)
