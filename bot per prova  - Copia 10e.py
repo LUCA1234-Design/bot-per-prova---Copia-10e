@@ -159,7 +159,9 @@ WS_HEALTH = {}
 WS_FAILCOUNT = {}
 LAST_MESSAGE_TIME = {}
 LAST_MESSAGE_LOCK = threading.Lock()
-WS_STALE_TIMEOUT = 60  # Secondi senza messaggi prima che il watchdog riavvii il WS
+WS_STALE_TIMEOUT = 60       # Secondi senza messaggi prima che il watchdog riavvii il WS
+WATCHDOG_GRACE_PERIOD = 30  # Secondi di attesa iniziale prima che il watchdog inizi a monitorare
+WATCHDOG_CHECK_INTERVAL = 15  # Secondi tra ogni controllo del watchdog
 ACTIVE_HEARTBEATS = set()
 LOGBOOK_FILE = "signals_log_v15.csv"
 LOGBOOK_LOCK = threading.Lock()
@@ -3324,9 +3326,9 @@ def watchdog(ws, name, stale_timeout=None):
     if stale_timeout is None:
         stale_timeout = WS_STALE_TIMEOUT
     try:
-        time.sleep(30)  # Grace period iniziale per permettere la connessione
+        time.sleep(WATCHDOG_GRACE_PERIOD)  # Grace period iniziale per permettere la connessione
         while True:
-            time.sleep(15)  # Check ogni 15 secondi
+            time.sleep(WATCHDOG_CHECK_INTERVAL)  # Check ogni 15 secondi
             with LAST_MESSAGE_LOCK:
                 last = LAST_MESSAGE_TIME.get(name, 0)
             if last == 0:
@@ -3340,7 +3342,7 @@ def watchdog(ws, name, stale_timeout=None):
                     pass
                 break  # Il loop in _run_ws ricreerà il WS
     except Exception as e:
-        logger.error(f"🐕 [WATCHDOG] {name} errore: {e}")
+        logger.exception(f"🐕 [WATCHDOG] {name} errore: {e}")
 
 def start_ws_for_tf(tf):
     num_ws = {"1h": 10, "4h": 6, "15m": 12}.get(tf, 10)
