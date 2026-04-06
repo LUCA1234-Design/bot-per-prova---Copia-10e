@@ -3249,9 +3249,6 @@ def heartbeat(name):
 # ============================
 # FALLBACK REST — CHIUSURA CANDELE (V16 SMART RATE-LIMIT)
 # ============================
-# ============================
-# FALLBACK REST — CHIUSURA CANDELE (V16 SMART RATE-LIMIT)
-# ============================
 
 POLL_CLOSED_ENABLE = True
 POLL_CLOSED_INTERVAL = 60  # Secondi tra ogni check
