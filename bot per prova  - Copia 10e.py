@@ -50,15 +50,15 @@ AI_URL_ANALYST = "http://127.0.0.1:1234/v1/chat/completions"
 AI_MODEL_ANALYST = "qwen2.5-coder-7b-instruct"  # <--- INSERISCI QUI IL NOME ESATTO DEL MODELLO GRANDE
 AI_TIMEOUT = 45
 
-# PARAMETRI RELAXED V15
-THRESHOLD_BASE = 0.35
+# PARAMETRI SNIPER V15
+THRESHOLD_BASE = 0.45
 ACCOUNT_BALANCE = 1000.0
 HG_ENABLED = True
 HG_MONITOR_ALL = True
 HG_TF = ["1h", "15m"]
 HG_TF_SECONDS = {"1h": 3600, "15m": 900}
 HG_COOLDOWN = 180
-HG_RVOL_PARTIAL_MIN = 2.0
+HG_RVOL_PARTIAL_MIN = 2.2
 HG_RVOL_BAR_MIN = 1.3
 HG_SQUEEZE_MIN_BARS = 10
 HG_NR7_RVOL_MIN = 1.2
@@ -71,12 +71,12 @@ HG_RS_ON = True
 HG_MIN_QUOTE_VOL = 70000 
 HG_QVOL_LOOKBACK = 20
 HG_CFG = {
-    "1h": {"rvol_partial_min": 1.4, "rvol_bar_min": 1.3, "min_score": 0.65, "cooldown": HG_COOLDOWN},
-    "15m": {"rvol_partial_min": 2.3, "rvol_bar_min": 1.5, "min_score": 0.78, "cooldown": 300},
+    "1h": {"rvol_partial_min": 1.5, "rvol_bar_min": 1.3, "min_score": 0.72, "cooldown": HG_COOLDOWN},
+    "15m": {"rvol_partial_min": 2.5, "rvol_bar_min": 1.6, "min_score": 0.85, "cooldown": 900},
 }
 # Cooldown Segnali
-SIGNAL_COOLDOWN = 600
-SIGNAL_COOLDOWN_BY_TF = {"15m": 300, "1h": 600, "4h": 3600}
+SIGNAL_COOLDOWN = 1800
+SIGNAL_COOLDOWN_BY_TF = {"15m": 900, "1h": 3600, "4h": 7200}
 DIVERGENCE_MAX_AGE_HOURS = 4
 DIVERGENCE_MAX_AGE_CANDLES = 3
 DIVERGENCE_MAX_AGE_BY_TF = {"15m": 2, "1h": 2, "4h": 1}
@@ -84,9 +84,17 @@ BREAKOUT_RULES = {
     "1h": {"vol_min": 0.6, "break_mult": 1.001, "min_closes": 1, "atr_mult": 0.08},
     "15m": {"vol_min": 0.6, "break_mult": 1.0004, "min_closes": 1, "atr_mult": 0.05},
 }
-ORARI_VIETATI_UTC  = list(range(1, 7))   # 6 ore vietate: 1-6 UTC (mercato morto)
-ORARI_MIGLIORI_UTC = list(range(8, 15)) + [20, 21, 22]  # Ore d'oro: sessioni EU + US
-ORARI_MEDIOCRI_UTC = [0, 7, 15, 16, 17, 18, 19, 23]     # Ore mediocri: transizioni
+ORARI_VIETATI_UTC  = [3, 4]  # Solo le 2 ore più morte
+ORARI_MIGLIORI_UTC = list(range(7, 17)) + list(range(19, 24)) + [0, 1]  # Ore operative
+ORARI_MEDIOCRI_UTC = [2, 5, 6, 17, 18]  # Ore di transizione
+
+# ============================
+# 🎯 SOGLIE SNIPER CONFIGURABILI
+# ============================
+MIN_RR = 1.80  # Reward:Risk minimo accettato
+MIN_FUSION_SCORE = 0.50
+MIN_AGENT_CONFIRMATIONS = 4
+NON_OPTIMAL_HOUR_PENALTY = 0.05
 
 # ============================
 # ⚙️ RISK ENGINE ISTITUZIONALE
@@ -284,16 +292,6 @@ def calc_obv(df):
         else: obv.append(obv[-1])
     return pd.Series(obv, index=df.index)
 
-def _bbands(series, n=20, k=2.0):
-    m = series.rolling(n).mean()
-    s = series.rolling(n).std(ddof=0)
-    return m, m + k*s, m - k*s, (2*k*s)
-
-def _keltner(df, n=20, m=2.0):
-    ema = df["close"].ewm(span=n).mean()
-    atr = calc_atr(df)
-    return ema, ema + m*atr, ema - m*atr, (2*m*atr)
-
 def calc_macd(series):
     ema12 = series.ewm(span=12).mean()
     ema26 = series.ewm(span=26).mean()
@@ -428,16 +426,6 @@ def round_to(value, step):
 # ============================
 # 🏛️ REGIME DETECTION PROBABILISTICO (IL GENERALE)
 # ============================
-def get_trend(df):
-    try:
-        if df is None or len(df) < 50: return "laterale"
-        ema50 = df['close'].ewm(span=50).mean()
-        ema200 = df['close'].ewm(span=200).mean()
-        if ema50.iloc[-1] > ema200.iloc[-1] * 1.002: return "rialzista"
-        if ema50.iloc[-1] < ema200.iloc[-1] * 0.998: return "ribassista"
-        return "laterale"
-    except: return "laterale"
-
 def get_probabilistic_regime(df):
     """V15: Calcola la probabilità dei 4 regimi (Trend, Range, Shock)."""
     try:
@@ -462,126 +450,6 @@ def get_probabilistic_regime(df):
 
         return max(scores, key=scores.get), scores
     except: return "MEAN_REVERSION", {}
-
-def get_rvol_state(df, lookback=20):
-    try:
-        vol = df["volume"].fillna(0)
-        ma = vol.rolling(lookback).mean()
-        rvol = vol.iloc[-1] / ma.iloc[-1] if ma.iloc[-1] > 0 else 1.0
-        return "normale", rvol
-    except: return "sconosciuto", 1.0
-
-def get_symbol_quality(df):
-    """Qualità del simbolo basata su RVOL + ATR ratio + liquidità."""
-    try:
-        if df is None or len(df) < 50:
-            return -5
-        _, rvol = get_rvol_state(df)
-        atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
-        price = float(df["close"].iloc[-1])
-        if price <= 0:
-            return -5
-        atr_ratio = atr / price
-        score = 0
-        if 1.5 <= rvol <= 4.0: score += 5
-        elif 1.0 <= rvol < 1.5: score += 3
-        elif rvol < 0.7: score -= 3
-        if 0.002 <= atr_ratio <= 0.02: score += 5
-        elif 0.001 <= atr_ratio < 0.002: score += 2
-        elif atr_ratio < 0.0008: score -= 4
-        vol_avg = float(df["volume"].tail(20).mean())
-        if vol_avg > 1000000: score += 3
-        elif vol_avg > 100000: score += 1
-        else: score -= 2
-        return max(min(score, 10), -10)
-    except Exception:
-        return 0
-
-def get_regime_symbol(df):
-    """Classifica il regime del singolo simbolo."""
-    try:
-        if df is None or len(df) < 50:
-            return "neutro"
-        close = df["close"].dropna()
-        if len(close) < 50:
-            return "neutro"
-        ema50 = close.ewm(span=50).mean()
-        ema200 = close.ewm(span=200).mean()
-        if ema50.iloc[-1] > ema200.iloc[-1] * 1.005:
-            return "bull"
-        if ema50.iloc[-1] < ema200.iloc[-1] * 0.995:
-            return "bear"
-        return "neutro"
-    except Exception:
-        return "neutro"
-
-def get_global_regime():
-    """Regime globale basato su BTC + ETH combinati."""
-    try:
-        btc = historical_data.get("BTCUSDT", {}).get("1h")
-        eth = historical_data.get("ETHUSDT", {}).get("1h")
-        r_btc = get_regime_symbol(btc)
-        r_eth = get_regime_symbol(eth)
-        if r_btc == "bull" and r_eth == "bull":
-            return "bull"
-        if r_btc == "bear" and r_eth == "bear":
-            return "bear"
-        return "neutro"
-    except Exception:
-        return "neutro"
-
-def get_risk_regime_btc_eth():
-    """Risk regime basato su RSI + OBV + ATR di BTC e ETH."""
-    try:
-        btc = historical_data.get("BTCUSDT", {}).get("1h")
-        eth = historical_data.get("ETHUSDT", {}).get("1h")
-        if btc is None or eth is None:
-            return "neutral"
-        def _score(d):
-            try:
-                rsi = float(d["rsi"].iloc[-1]) if "rsi" in d.columns else 50
-                obv_slope = (float(d["obv"].iloc[-1]) - float(d["obv"].iloc[-5])) if "obv" in d.columns and len(d) > 5 else 0
-                atr = float(d["atr"].iloc[-1]) if "atr" in d.columns else 0
-                price = float(d["close"].iloc[-1])
-                atr_ratio = atr / price if price > 0 else 0
-                s = 0
-                if rsi > 55: s += 1
-                if obv_slope > 0: s += 1
-                if atr_ratio > 0.01: s += 1
-                if rsi < 45: s -= 1
-                if obv_slope < 0: s -= 1
-                if atr_ratio < 0.004: s -= 1
-                return s
-            except: return 0
-        total = _score(btc) + _score(eth)
-        if total >= 3: return "risk_on"
-        if total <= -3: return "risk_off"
-        return "neutral"
-    except Exception:
-        return "neutral"
-
-def get_divergence_direction(div_type): 
-    if "bull" in div_type: return "bull"
-    if "bear" in div_type: return "bear"
-    return "none"
-
-def get_multi_tf_divergence_state(symbol):
-    """Combina lo stato divergenze su 15m, 1h, 4h."""
-    try:
-        result = {}
-        if symbol not in divergence_state:
-            return result
-        for tf in ["15m", "1h", "4h"]:
-            div = divergence_state.get(symbol, {}).get(tf, {})
-            if div.get("rsi_advanced", "none") != "none":
-                result[tf] = {
-                    "type": div["rsi_advanced"],
-                    "quality": div.get("rsi_quality", 0),
-                    "early": div.get("div_early", "none"),
-                }
-        return result
-    except Exception:
-        return {}
 
 # ============================
 # 🔬 MICROSTRUCTURE ENGINE
@@ -2735,9 +2603,9 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
             ai_ctx = build_ai_context_simple(symbol, tf, direction, kind, features, df, entry, sl, tp1, tp2, tp3)
             ai_res = call_ai_safe(symbol, tf, score, direction, ai_ctx)
             
-            # SOGLIA CECCHINO: Scarta i segnali con successo < 75 o se l'AI dice che è "debole"
-            if int(ai_res.get('successo', 0)) < 75 or ai_res.get('forza', 'media').lower() == 'debole':
-                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (Segnale debole o sotto 75%).")
+            # SOGLIA CECCHINO: Scarta i segnali con successo < 78 o se l'AI dice che è "debole"
+            if int(ai_res.get('successo', 0)) < 78 or ai_res.get('forza', 'media').lower() == 'debole':
+                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (Segnale debole o sotto 78%).")
                 return 
 
             commento_ai = ai_res.get('commento', '')
@@ -2915,7 +2783,7 @@ def process_closed_candle(symbol, tf, k):
         if AI_ENABLED:
             scout_ctx = f"Regime: {current_regime}, Z: {z_curr:.2f}, Trend: {get_trend(df)}"
             res_scout = call_ai_safe(symbol, tf, 0, direction, scout_ctx, role="scout")
-            if int(res_scout.get("successo", 0)) < 65:
+            if int(res_scout.get("successo", 0)) < 70:
                 logger.info(f"⛔ SCOUT VETO: {res_scout.get('commento')}")
                 return
 
@@ -2927,8 +2795,8 @@ def process_closed_candle(symbol, tf, k):
         reward = abs(tp2 - entry) if tp2 else 0
         rr_ratio = reward / risk
         
-        # CECCHINO: Scarta se non paga almeno 1.5 volte il rischio al TP2
-        if rr_ratio < 1.5:
+        # CECCHINO: Scarta se non paga almeno MIN_RR volte il rischio al TP2
+        if rr_ratio < MIN_RR:
             logger.info(f"⛔ R:R INSUFFICIENTE ({rr_ratio:.2f}) su {symbol}")
             return
             
@@ -2944,9 +2812,9 @@ def process_closed_candle(symbol, tf, k):
             analyst_ctx = f"SNIPER SETUP. Regime: {current_regime}. RR: {rr_ratio:.2f}. Z-Score: {z_curr:.2f}. Kelly: {kelly_pct:.1f}%"
             res_analyst = call_ai_safe(symbol, tf, 0, direction, analyst_ctx, role="analyst")
             
-            # SOGLIA CECCHINO ABBASSATA A 60: Permette di ricevere anche i segnali DEBOLI
-            if int(res_analyst.get("successo", 0)) < 60:
-                logger.info(f"⛔ ANALYST VETO (<60%): {res_analyst.get('commento')}")
+            # SOGLIA CECCHINO ALZATA A 65: Solo segnali di media/alta qualità
+            if int(res_analyst.get("successo", 0)) < 65:
+                logger.info(f"⛔ ANALYST VETO (<65%): {res_analyst.get('commento')}")
                 return
                 
             ai_comm = res_analyst.get("commento", "")
@@ -3115,7 +2983,7 @@ def update_realtime(symbol, tf, k):
                                     if ora_utc in ORARI_MIGLIORI_UTC:
                                         score_adj += 0.03  # Bonus ore d'oro
                                     elif ora_utc in ORARI_MEDIOCRI_UTC:
-                                        score_adj -= 0.05  # Penalità ore mediocri
+                                        score_adj -= 0.08  # Penalità ore mediocri
 
                                     if score_adj >= cfg["min_score"]:
                                         last_key = (int(k.get("t", 0)), ev["dir"], tf)
@@ -3138,8 +3006,8 @@ def update_realtime(symbol, tf, k):
                                                         logger.info(f"🔬 [MICRO] {symbol} bloccato: score={micro_det.get('micro_score')}")
                                                     else:
                                                         prob = calculate_signal_probability(df, ev["dir"], ev, regime_now, tf)
-                                                        if prob < 0.72:
-                                                            logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 72%")
+                                                        if prob < 0.75:
+                                                            logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 75%")
                                                         else:
                                                             # ALL GATES PASSED → SEND
                                                             send_hidden_gem(
@@ -3211,8 +3079,8 @@ def update_realtime(symbol, tf, k):
                         logger.info(f"🔬 [MICRO] {symbol} bloccato: score={micro_det.get('micro_score')}")
                         continue
                     prob = calculate_signal_probability(df, ev["dir"], ev, regime_now, tf)
-                    if prob < 0.72:
-                        logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 72%")
+                    if prob < 0.75:
+                        logger.info(f"📊 [PROB] {symbol} P={prob:.0%} < 75%")
                         continue
 
                     # ALL GATES PASSED → SEND
@@ -3230,173 +3098,6 @@ def update_realtime(symbol, tf, k):
         except Exception as e:
             logger.error(f"Errore update_realtime {symbol} {tf}: {e}")
             traceback.print_exc()
-
-
-# ============================
-# WEBSOCKET CALLBACKS
-# ============================
-
-
-def on_message(ws, message):
-    try:
-        data = json.loads(message)
-        payload = data.get("data", {})
-        if "k" not in payload:
-            return
-        k = payload["k"]
-        symbol = k["s"]
-        interval = k["i"]
-        if interval not in ("1h", "4h", "15m"):
-            return
-        tf = interval
-        update_realtime(symbol, tf, k)
-        name = getattr(ws, "name", "WS")
-        now = time.time()
-        with LAST_MESSAGE_LOCK:
-            LAST_MESSAGE_TIME[name] = now
-        WS_HEALTH[name] = {"alive": True, "last_msg": now}
-        if k.get("x") is True:
-            if tf == "1h":
-                logger.debug(f"[CANDLE-CLOSED] {symbol} {tf}")
-            process_closed_candle(symbol, tf, k)
-    except Exception as e:
-        logger.error(f"Errore on_message: {e}")
-        traceback.print_exc()
-
-
-def on_error(ws, error):
-    name = getattr(ws, "name", "WS")
-    logger.error(f"[{name}] WS error: {error}")
-
-
-def on_close(ws, close_status_code, close_msg):
-    name = getattr(ws, "name", "WS")
-    logger.warning(f"[{name}] WS chiuso: {close_status_code} {close_msg}")
-
-
-def on_open(ws):
-    name = getattr(ws, "name", "WS")
-    logger.info(f"[{name}] WS aperto")
-
-
-# ============================
-# WEBSOCKET MANAGER
-# ============================
-
-WS_RECONNECT_MIN = 5
-WS_RECONNECT_MAX = 120
-
-TF_CONFIG = {"1h": {"num_ws": 10}, "4h": {"num_ws": 6}, "15m": {"num_ws": 12}}
-WS_MAX_FAIL = 5
-STREAM_TIMEOUT = 25
-HEARTBEAT_INTERVAL = 30
-WS_REBALANCE_LOCK = threading.Lock()
-
-
-def ws_health_report():
-    try:
-        rep = []
-        now = time.time()
-        for name, data in WS_HEALTH.items():
-            last_msg = data.get("last_msg", 0)
-            alive = data.get("alive", False)
-            fails = WS_FAILCOUNT.get(name, 0)
-            age = int(now - last_msg)
-            rep.append(f"{name}: alive={alive}, last={age}s, fails={fails}")
-        if rep:
-            logger.info("📊 WS HEALTH:\n" + "\n".join(rep))
-        else:
-            logger.info("📊 WS HEALTH: nessun WS registrato.")
-    except Exception as e:
-        logger.error(f"[WS-HEALTH] Errore: {e}")
-        traceback.print_exc()
-
-
-def watchdog(ws, name):
-    while True:
-        try:
-            time.sleep(5)
-            with LAST_MESSAGE_LOCK:
-                last = LAST_MESSAGE_TIME.get(name, 0)
-            if time.time() - last > STREAM_TIMEOUT:
-                logger.warning(f"[{name}] ⚠️ STREAM VUOTO — restart")
-                WS_HEALTH[name]["alive"] = False
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-                return
-        except Exception as e:
-            logger.error(f"[{name}-WATCHDOG] Errore: {e}")
-            traceback.print_exc()
-            return
-
-
-def heartbeat(name):
-    while True:
-        try:
-            time.sleep(HEARTBEAT_INTERVAL)
-            logger.debug(f"[{name}] ❤️ Heartbeat")
-        except Exception as e:
-            logger.error(f"[{name}-HEARTBEAT] Errore: {e}")
-            traceback.print_exc()
-            return
-
-
-def start_ws_for_tf(tf):
-    num_ws = TF_CONFIG.get(tf, {}).get("num_ws", 10)
-    symbols_list = get_symbols_for_tf(tf)
-    group_size = max(1, math.ceil(max(1, len(symbols_list)) / num_ws))
-    groups = split_symbols_v4(tf, group_size=group_size, symbols=symbols_list)
-    
-    for i, group in enumerate(groups):
-        if not group: continue
-        name = f"WS_{tf}_{i+1}"
-        url = build_stream_url_v4(group, tf)
-        logger.info(f"[WS-INIT] {name} -> {len(group)} simboli")
-        WS_HEALTH[name] = {"alive": False, "last_msg": time.time()}
-
-        def _run_ws(url=url, name=name):
-            threading.current_thread().name = name
-            while True:
-                try:
-                    ws = websocket.WebSocketApp(
-                        url, 
-                        on_message=on_message, 
-                        on_error=on_error, 
-                        on_close=on_close, 
-                        on_open=on_open
-                    )
-                    ws.name = name
-                    # V16 STABILITY FIX: Ping 0 (Passivo) + SSL None (Compatibilità)
-                    ws.run_forever(
-                        ping_interval=0, 
-                        ping_timeout=None, 
-                        sslopt={"cert_reqs": ssl.CERT_NONE}
-                    )
-                except Exception as e:
-                    logger.error(f"[{name}] Err: {e}")
-                    time.sleep(5)
-                time.sleep(5)
-
-        t = threading.Thread(target=_run_ws, daemon=True, name=name)
-        t.start()
-
-
-def start_multi_websocket_v4():
-    for tf in TF_CONFIG.keys():
-        start_ws_for_tf(tf)
-
-    def _health_loop():
-        while True:
-            time.sleep(300)
-            ws_health_report()
-
-    threading.Thread(target=_health_loop, daemon=True, name="WS-HEALTH-LOOP").start()
-
-
-
-
 
 # ============================
 # FALLBACK REST — CHIUSURA CANDELE (V16 SMART RATE-LIMIT)
