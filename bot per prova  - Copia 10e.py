@@ -2606,9 +2606,9 @@ def send_hidden_gem(symbol, tf, direction, kind, features, df, phase_label):
             ai_ctx = build_ai_context_simple(symbol, tf, direction, kind, features, df, entry, sl, tp1, tp2, tp3)
             ai_res = call_ai_safe(symbol, tf, score, direction, ai_ctx)
             
-            # SOGLIA CECCHINO: Scarta i segnali con successo < 78 o se l'AI dice che è "debole"
-            if int(ai_res.get('successo', 0)) < 78 or ai_res.get('forza', 'media').lower() == 'debole':
-                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (Segnale debole o sotto 78%).")
+            # SOGLIA CECCHINO: Scarta i segnali con successo < 60
+            if int(ai_res.get('successo', 0)) < 60:
+                logger.info(f"⛔ [HG-VETO] {symbol} scartato da AI Sniper (successo < 60%).")
                 return 
 
             commento_ai = ai_res.get('commento', '')
@@ -3366,7 +3366,7 @@ def start_ws_for_tf(tf):
                     # Questo thread riavvierà forzatamente il WS se si blocca.
                     threading.Thread(target=watchdog, args=(ws, name), daemon=True, name=f"WATCHDOG_{name}").start()
                     
-                    ws.run_forever(ping_interval=0, ping_timeout=None, sslopt={"cert_reqs": ssl.CERT_NONE})
+                    ws.run_forever(ping_interval=20, ping_timeout=10, sslopt={"cert_reqs": ssl.CERT_NONE})
                 except Exception as e: 
                     logger.error(f"[{name}] Crash interno WS: {e}")
                     time.sleep(5)
